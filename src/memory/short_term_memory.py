@@ -1,0 +1,167 @@
+"""Budget complete model requests and replace eligible history with a summary."""
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+import json
+import math
+
+from llm.i_llm_client import ILLMClient, LLMResponse
+from llm.messages import Message
+from llm.tool_schema_builder import tools_to_openai_format
+
+
+SUMMARIZATION_PROMPT = """Summarize this conversation concisely. Preserve the current task,
+observed facts, completed work, uncertain effects, unresolved questions, exact saved-output paths, and user constraints.
+Do not imply that attempted actions succeeded without evidence.
+
+Conversation:
+{conversation}"""
+_SUMMARY_SYSTEM = "You summarize conversations for continued work."
+_SUMMARY_PREFIX = "[Summary of prior conversation]\n"
+_CHARS_PER_TOKEN = 3.5
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservatively estimate tokens; provider-specific tokenization can differ."""
+    return max(1, math.ceil(len(text.encode("utf-8")) / _CHARS_PER_TOKEN))
+
+
+def _estimate_message_tokens(message: Message) -> int:
+    total = _estimate_tokens(json.dumps(message.to_dict(), ensure_ascii=False, default=str)) + 8
+    for image in message.images:
+        total += max(0, 1600 - _estimate_tokens(image.data))
+    return total
+
+
+def estimate_request_tokens(messages: list[Message], *, system: str,
+                            tools=None, response_schema=None, max_tokens: int = 4096) -> int:
+    """Include neutral payloads, standing instructions, schemas and response reserve."""
+    total = sum(_estimate_message_tokens(message) for message in messages)
+    total += _estimate_tokens(system) + 16 + max_tokens
+    if tools:
+        total += _estimate_tokens(json.dumps(tools_to_openai_format(tools), ensure_ascii=False))
+    if response_schema is not None:
+        total += _estimate_tokens(json.dumps(response_schema.model_json_schema(), ensure_ascii=False)) + 32
+    return total
+
+
+class ContextBudgetExceeded(ValueError):
+    """The estimated request cannot fit without dropping mandatory information."""
+
+    def __init__(self, estimated_tokens: int, capacity: int, *, reason: str | None = None):
+        self.estimated_tokens = estimated_tokens
+        self.capacity = capacity
+        self.reason = reason
+        super().__init__(reason or f"Estimated context requires {estimated_tokens} tokens; model capacity is {capacity}.")
+
+
+@dataclass
+class ShortTermMemoryConfig:
+    summarization_threshold: float = 0.80
+    min_recent_messages: int = 4
+    response_token_reserve: int = 4096
+    summary_max_tokens: int = 500
+
+    def __post_init__(self) -> None:
+        if not 0 < self.summarization_threshold <= 1:
+            raise ValueError("Summarization threshold must be between zero and one")
+        if self.min_recent_messages < 1 or self.summary_max_tokens < 1 or self.response_token_reserve < 0:
+            raise ValueError("Recent history and summary limits must be positive; response reserve cannot be negative")
+
+
+class ShortTermMemory:
+    """One agent's history compactor; callers retain the returned consumed history."""
+
+    def __init__(self, llm_client: ILLMClient, config: ShortTermMemoryConfig | None = None,
+                 *, chat: Callable[..., Awaitable[LLMResponse]] | None = None):
+        self._llm_client = llm_client
+        self._config = config or ShortTermMemoryConfig()
+        self._chat = chat
+
+    async def process_messages(self, messages: list[Message], *, system: str = "", tools=None,
+                               response_schema=None, max_tokens: int | None = None,
+                               eligible_count: int | None = None, allow_summary: bool = True) -> list[Message]:
+        """Fit a complete request by summarizing whole older groups, or reject it.
+
+        Only the first eligible_count messages may be compacted. Per-call
+        format instructions and the recent history remain verbatim.
+        """
+        reserve = self._config.response_token_reserve if max_tokens is None else max_tokens
+        capacity = self._llm_client.context_window
+        if capacity <= 0 or reserve < 0:
+            raise ValueError("Context capacity must be positive and response reserve nonnegative")
+        request = dict(system=system, tools=tools, response_schema=response_schema, max_tokens=reserve)
+        estimated = estimate_request_tokens(messages, **request)
+        threshold = int(capacity * self._config.summarization_threshold)
+        if estimated <= threshold:
+            return messages
+        eligible = len(messages) if eligible_count is None else eligible_count
+        if not 0 <= eligible <= len(messages):
+            raise ValueError("Eligible history length is outside the request")
+        split = self._find_split_point(messages, eligible, request, threshold) if allow_summary else 0
+        if not split and estimated > capacity and allow_summary:
+            split = self._find_split_point(messages, eligible, request, capacity)
+        if not split:
+            if estimated > capacity:
+                raise ContextBudgetExceeded(estimated, capacity)
+            return messages
+
+        pinned = self._pinned_request(messages, eligible, split)
+        try:
+            summary = await self._summarize(messages[:split])
+        except ContextBudgetExceeded as error:
+            if estimated <= capacity and error.reason is None:
+                return messages
+            raise
+        processed = [Message("user", _SUMMARY_PREFIX + summary), *pinned, *messages[split:]]
+        compacted_estimate = estimate_request_tokens(processed, **request)
+        if compacted_estimate > capacity:
+            raise ContextBudgetExceeded(compacted_estimate, capacity)
+        return processed
+
+    @staticmethod
+    def _pinned_request(messages: list[Message], eligible: int, split: int) -> list[Message]:
+        latest = next((index for index in range(eligible - 1, -1, -1)
+                       if messages[index].role == "user"), None)
+        return [messages[latest]] if latest is not None and latest < split else []
+
+    def _find_split_point(self, messages: list[Message], eligible: int, request: dict, budget: int) -> int:
+        max_split = max(0, eligible - self._config.min_recent_messages)
+        placeholder = Message("user", _SUMMARY_PREFIX + "x" * math.ceil(self._config.summary_max_tokens * _CHARS_PER_TOKEN))
+        costs = [_estimate_message_tokens(message) for message in messages]
+        suffix_costs = [0] * (len(messages) + 1)
+        for index in range(len(messages) - 1, -1, -1):
+            suffix_costs[index] = suffix_costs[index + 1] + costs[index]
+        fixed_cost = estimate_request_tokens([], **request) + _estimate_message_tokens(placeholder)
+        pinned_index = next((index for index in range(eligible - 1, -1, -1)
+                             if messages[index].role == "user"), None)
+        for split in range(1, max_split + 1):
+            # An assistant call and all following tool replies form one group,
+            # including opaque provider continuation state on the assistant.
+            if split < len(messages) and messages[split].role == "tool":
+                continue
+            pinned_cost = costs[pinned_index] if pinned_index is not None and pinned_index < split else 0
+            if fixed_cost + pinned_cost + suffix_costs[split] <= budget:
+                return split
+        return 0
+
+    async def _summarize(self, messages: list[Message]) -> str:
+        conversation = "\n".join(
+            f"{message.role}: {message.text}"
+            + (f"\nReasoning: {message.reasoning}" if message.reasoning else "")
+            + (f"\nTool calls: {json.dumps([call.__dict__ for call in message.tool_calls])}" if message.tool_calls else "")
+            + (f"\nTool reply: {message.tool_call_id}; error={message.is_error}" if message.role == "tool" else "")
+            + (f"\n[{len(message.images)} image(s)]" if message.images else "")
+            for message in messages
+        )
+        request = dict(messages=[Message("user", SUMMARIZATION_PROMPT.format(conversation=conversation))],
+                       system=_SUMMARY_SYSTEM, tools=None, max_tokens=self._config.summary_max_tokens)
+        estimated = estimate_request_tokens(**request)
+        if estimated > self._llm_client.context_window:
+            raise ContextBudgetExceeded(estimated, self._llm_client.context_window)
+        response = (await self._chat(purpose="summary", **request) if self._chat is not None
+                    else await self._llm_client.chat(**request))
+        if response.stop_reason != "end_turn" or response.message.tool_calls or not response.message.text.strip():
+            raise ContextBudgetExceeded(estimated, self._llm_client.context_window,
+                                        reason="Context compaction failed because the model summary was incomplete.")
+        return response.message.text

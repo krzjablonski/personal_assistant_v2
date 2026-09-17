@@ -1,0 +1,22 @@
+.env
+.venv/
+.conda/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+src/data/
+downloads/
+*.log
+.idea/
+mcp_servers/.fetch_cache/
+mcp_servers/.analyze_image_cache/
+
+# AI
+.ai/
+.claude/
+evaluations/
+.docs/
+
+# Secrets
+client_secret.json
