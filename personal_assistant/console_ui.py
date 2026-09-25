@@ -21,6 +21,7 @@ from rich.table import Table
 from rich.text import Text
 from tool_framework.approval import ToolApprovalRequest, ToolApprovalStore
 from message_logger.redaction import redact_text, redact_value
+from personal_assistant.cli_input import ApprovalInput, supports_interactive_input
 
 
 _T = TypeVar("_T")
@@ -120,9 +121,11 @@ class ConsoleUI:
         *,
         width: int | None = None,
         color: bool | None = None,
+        plain: bool = False,
     ) -> None:
         """Configure console output width, interactivity, and color for the selected stream."""
         self.stream = sys.stdout if stream is None else stream
+        self.plain = plain
         terminal_size = shutil.get_terminal_size(fallback=(88, 24))
         self.width = max(20, min(width or terminal_size.columns, 100))
         self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
@@ -277,6 +280,26 @@ class ConsoleUI:
         else:
             action = request.tool_name
         scope = _safe_text(json.dumps(arguments, ensure_ascii=False, indent=2, default=str))
+        if not self.plain and self.stream is sys.stdout and supports_interactive_input():
+            if isinstance(command, list):
+                summary = f"Action: {_safe_text(action)}\nReason: {_safe_text(redact_text(request.reason))}"
+                if arguments.get("cwd") is not None:
+                    summary += f"\nDirectory: {_safe_text(arguments['cwd'])}"
+                if arguments.get("stdin") is not None:
+                    summary += f"\nStdin / code:\n{_safe_text(arguments['stdin'])}"
+                if arguments.get("reviewed_files"):
+                    summary += "\nReviewed files: inspect full action details (d)."
+            else:
+                summary = f"Action: {_single_line(action)}\nReason: {_safe_text(redact_text(request.reason))}\n{scope}"
+            self._write("\r\033[2K")
+            allowed = await ApprovalInput(summary, scope, color=self.color).read()
+            if allowed:
+                recorded = store.approve(request.approval_id)
+            else:
+                recorded = store.deny(request.approval_id)
+            outcome = ("Allowed once" if allowed else "Denied") if recorded else "Request no longer available"
+            self.console.print(Text(f"{outcome}: {_single_line(action)}"))
+            return
         self._write(
             "\r\033[2K\nApproval required\n"
             f"  Action: {_single_line(action)}\n"

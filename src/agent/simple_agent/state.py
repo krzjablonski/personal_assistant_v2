@@ -18,7 +18,7 @@ class AgentStatus(Enum):
 class AgentConfig:
     """Agent configuration."""
 
-    max_iterations: int = 10
+    max_iterations: int = 50
     max_tokens: int = 4096
     agent_name: Optional[str] = None
     session_id: Optional[str] = None  # Shared identity for events and output files

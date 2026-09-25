@@ -10,7 +10,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from agent_skills.catalog import SkillCatalog, SkillDefinition
-from personal_assistant.cli_input import ChatCompleter, ChatInput, supports_interactive_input
+from personal_assistant.cli_input import ApprovalInput, ChatCompleter, ChatInput, supports_interactive_input
 
 
 def catalog():
@@ -57,6 +57,46 @@ class CompletionTests(unittest.TestCase):
 
 
 class KeyboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_approval_requires_confirmation_and_defaults_to_deny(self):
+        for keys, expected in (("\r", False), ("1\r", True), ("2\r", False), ("\x1b[A\r", True), ("\x1b", False), ("\x04", False)):
+            with self.subTest(keys=keys), create_pipe_input() as pipe:
+                dialog = ApprovalInput("Action: pwd", '{"argv": ["pwd"]}', input=pipe, output=DummyOutput())
+                pipe.send_text(keys)
+                async with asyncio.timeout(2):
+                    self.assertEqual(await dialog.read(), expected)
+
+    async def test_approval_details_do_not_decide_and_cancellation_unwinds(self):
+        with create_pipe_input() as pipe:
+            details = '{"argv": ["pwd"], "policy": {"network": "none"}}'
+            dialog = ApprovalInput("Action: pwd", details, input=pipe, output=DummyOutput())
+            task = asyncio.create_task(dialog.read())
+            try:
+                pipe.send_text("d")
+                async with asyncio.timeout(2):
+                    while dialog.body.text != details:
+                        await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                pipe.send_text("d")
+                async with asyncio.timeout(2):
+                    while dialog.body.text != "Action: pwd":
+                        await asyncio.sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertFalse(dialog.app.is_running)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_ctrl_c_cancels_approval_without_approving(self):
+        with create_pipe_input() as pipe:
+            dialog = ApprovalInput("Action: pwd", "{}", input=pipe, output=DummyOutput())
+            pipe.send_text("\x03")
+            with self.assertRaises(asyncio.CancelledError):
+                async with asyncio.timeout(2):
+                    await dialog.read()
+
     async def read_keys(self, keys):
         with create_pipe_input() as pipe:
             reader = ChatInput(catalog(), COMMANDS, input=pipe, output=DummyOutput())

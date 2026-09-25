@@ -276,7 +276,7 @@ async def _run(args: argparse.Namespace) -> int:
         (legacy / name).exists() for name in ("agent_config.db", "agent_memory.db")
     ):
         raise ValueError("Legacy data was found in WORKSPACE/src/data. Use --migrate-data-from with a new --data-dir, or --data-dir to keep using the legacy directory.")
-    ui = ConsoleUI(color=False if args.plain else None)
+    ui = ConsoleUI(color=False if args.plain else None, plain=args.plain)
     config = ConfigService(data_dir / "agent_config.db")
     try:
         if args.connect_google is not None:

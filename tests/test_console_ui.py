@@ -225,6 +225,50 @@ class TestConsoleUI(unittest.TestCase):
 
 
 class TestConsoleActivity(unittest.IsolatedAsyncioTestCase):
+    async def test_enhanced_approval_preserves_redacted_full_scope(self):
+        output = TtyBuffer()
+        store = ToolApprovalStore()
+        request = store.request("run_command", {"argv": ["python", "-"], "stdin": "print(42)",
+                                "cwd": "/workspace", "token": "private-secret", "policy": {"network": "none"}}, "Review code")
+        with patch("sys.stdout", output), patch("personal_assistant.console_ui.supports_interactive_input", return_value=True):
+            ui = ConsoleUI(color=False)
+            with patch("personal_assistant.console_ui.ApprovalInput") as dialog, patch.object(ui, "_read_input", AsyncMock()) as legacy:
+                dialog.return_value.read = AsyncMock(return_value=True)
+                await ui.approval_prompt(request, store)
+                summary, details = dialog.call_args.args
+                self.assertIn("python -", summary)
+                self.assertIn("print(42)", summary)
+                self.assertIn("/workspace", summary)
+                self.assertIn('"network": "none"', details)
+                self.assertNotIn("private-secret", details + summary)
+                legacy.assert_not_called()
+        self.assertEqual(store.get(request.approval_id).status, "approved")
+
+    async def test_enhanced_approval_does_not_report_expired_request_as_allowed(self):
+        output = TtyBuffer()
+        store = ToolApprovalStore()
+        request = store.request("run_command", {"argv": ["pwd"]}, "Review", expires_at=0)
+        with patch("sys.stdout", output), patch("personal_assistant.console_ui.supports_interactive_input", return_value=True):
+            ui = ConsoleUI(color=False)
+            with patch("personal_assistant.console_ui.ApprovalInput") as dialog:
+                dialog.return_value.read = AsyncMock(return_value=True)
+                await ui.approval_prompt(request, store)
+        self.assertEqual(store.get(request.approval_id).status, "unavailable")
+        self.assertNotIn("Allowed once:", output.getvalue())
+        self.assertIn("Request no longer available:", output.getvalue())
+
+    async def test_plain_mode_keeps_line_based_approval(self):
+        output = TtyBuffer()
+        store = ToolApprovalStore()
+        request = store.request("run_command", {"argv": ["pwd"]}, "Review")
+        with patch("sys.stdout", output), patch("personal_assistant.console_ui.supports_interactive_input", return_value=True):
+            ui = ConsoleUI(color=False, plain=True)
+            with patch("personal_assistant.console_ui.ApprovalInput") as dialog, patch.object(ui, "_read_input", AsyncMock(return_value="2")):
+                await ui.approval_prompt(request, store)
+                dialog.assert_not_called()
+        self.assertEqual(store.get(request.approval_id).status, "denied")
+        self.assertIn("Resolved action:", output.getvalue())
+
     async def test_track_prompts_for_and_grants_one_time_approval(self) -> None:
         """Verify interactive tracking presents a command and grants the selected one-time approval."""
         output = TtyBuffer()
