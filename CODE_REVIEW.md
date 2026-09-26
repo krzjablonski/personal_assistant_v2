@@ -24,7 +24,8 @@ Overall: the security architecture is careful — container isolation, credentia
 | 10 | Medium | Browser approval | Approval shows page-controlled `aria-label` instead of visible text |
 | 11 | Medium | Agent loop | `max_tokens` continuation sends history ending on an assistant turn (Gemini/new Claude reject) ✔ |
 | 12 | Medium | Memory | FTS recall wraps the whole query as one phrase → keyword recall mostly fails ✔ |
-| 13–30 | Low | various | See "Low" section |
+| 13 | Medium | Agent loop | Unbounded "confirmed_changes" (with raw script stdout) injected into the system prompt every call ✔ |
+| 14–33 | Low | various | See "Low" section |
 
 ---
 
@@ -99,34 +100,41 @@ An email saying "open `https://attacker/?d=<summary of inbox>`" leaks data silen
 `src/memory/long_term_memory.py:110` wraps the whole query as one FTS5 phrase; `meeting preferences` won't match "prefers morning meetings". (No SQL injection — all queries are parameterized.)
 **Fix:** quote each token separately and join with `OR` (rank by bm25).
 
+### 13. Effect context grows unbounded and elevates untrusted text ✔ verified
+`src/agent_skills/runtime.py:359-362` records every successful non-read-only skill command as a `confirmed_changes` entry embedding up to 4,000 chars of script stdout; `state.py:58-76` only dedupes exact text, and `simple_agent.py:341-345` adds all of them to the **system prompt** on every call as "Protected effect context". Compaction can't shrink it: ~50 attachment downloads ≈ 186 KB → `ContextBudgetExceeded` every turn until `/clear`. Attachment filenames (sender-controlled, lightly sanitized in `email_utils.py:247`) thereby move from a tool result into the system prompt.
+**Fix:** store fixed summaries (`email/download_attachments exit 0, see tool result <id>`) without stdout, and cap the list.
+
 ---
 
 ## Low
 
-13. **Redaction misses common secret formats** (`src/message_logger/redaction.py`): `Authorization: Basic xxx` / `token ghp_…` (only scheme masked), `--token=abc`, `--api-key sk-…`, `https://user:pass@host`, bare `sk-…`/`ghp_…`/`ya29.…`, and all but the first cookie pair. Affects logs and `--trace redacted` (which otherwise sends full content to Langfuse).
-14. **Unreviewed large scripts via wrappers** (`console_tools.py:62-67`): files >1 MB are only rejected for recognized interpreters; `env python big`, `timeout 60 python x`, `nice sh x`, `perl x.pl` are silently unreviewed.
-15. **Plain-mode approval accepts type-ahead** (`console_ui.py:237-265,311-322`): no `tcflush`; a pasted line `1`/`o`/`once` auto-approves the next command.
-16. **Protected-path gaps** (`docker_console.py:47-60`): `<repo>/.git` (hooks), `<repo>/tools`, user site-packages, `$XDG_RUNTIME_DIR` (D-Bus socket, same uid), `~/.local/share/keyrings`, `~/.password-store`, `~/Library/{Cookies,Mail,Messages}`.
-17. **SSRF check bypassable** (`src/agent_skills/web_research/providers.py:133-150`): `127.1`, `0x7f.0.0.1`, `10.0.0.1.` (trailing dot), `*.nip.io` pass. Low impact because the third-party provider fetches.
-18. **Lone `@` blocks input** (`personal_assistant/skill_references.py:7`): regex allows an empty name, so "meet @ 5pm" errors "Unknown skill reference @".
-19. **Invisible Unicode in approvals**: bidi overrides (U+202A–202E, U+2066–2069) and zero-width chars pass `_safe_text`.
-20. **Email approval summary omits recipient/account** when `--to` comes from `EMAIL_TO` (`console_ui.py:282-289`); calendar approvals omit account/calendar.
-21. **Calendar scripts crash on mixed aware/naive datetimes** (`gcal_utils.py:57` → uncaught `TypeError`).
-22. **Large email reads**: up to 1000×20k chars but capture stops at 1 MB (`script_executor.py:15`) → truncated JSON returned as success; 1000 sequential fetches hit the 120 s timeout and are retried as "transient".
-23. **Skill scripts drop proxy/CA env** (`script_executor.py:21` passes only PATH/HOME/LANG/LC_ALL) → Google/wiki calls fail behind corporate proxies.
-24. **One Google token with all scopes** is given to read-only scripts too.
-25. **`ATTACHMENTS_DIR` created with default umask** (`download_attachments.py:48`); O_EXCL race reports error instead of retrying; multi-address Reply-To breaks reply drafts (`create_draft_email.py:16-20`).
-26. **Agent loop robustness**: status left RUNNING if a second cancel lands during `close_resources` (`simple_agent.py:239-243`); dangling `tool_calls` if a non-cancel exception escapes `ActionRunner.run` (`simple_agent.py:313-327`) → every later request 400s until `/clear`; unbounded concurrency for batchable reads (`actions.py:134-137`).
-27. **Console correctness**: `OSError` in execute-time recheck (`console_tools.py:147`) reported as "changes unconfirmed" though no container ran; argv elements >128 KB fail with `E2BIG` misreported as "Docker transport failed"; timeout discards partial stdout (`script_executor.py:179-186`); blocking `subprocess.run` in async code (`docker_console.py:192-199,260`) freezes UI/cancel.
-28. **Transport/supply chain**: Gemini client has no explicit timeout (`gemini_client.py:54`); local provider allows plain `http://` to remote hosts (`cli_settings.py:59-61`); browser install uses pinned but unhashed requirements with no timeout (`browser_setup.py:307`); `pyproject.toml` leaves `cryptography`, `python-dotenv`, `PyYAML`, Google libs unpinned.
-29. **Filesystem**: `private_directory` silently chmods any user-named `--data-dir` to 0700 (`src/config_service/paths.py:27-31`); migration report copy follows symlinks (`paths.py:75-78`); migration `FileExistsError` shown as generic "Unable to start" (`cli.py:306-313`).
-30. **Browser worker**: an oversized request line (>32 KB) kills the worker loop (`browser_worker.py:256-262`).
+14. **Redaction misses common secret formats** (`src/message_logger/redaction.py`): `Authorization: Basic xxx` / `token ghp_…` (only scheme masked), `--token=abc`, `--api-key sk-…`, `https://user:pass@host`, bare `sk-…`/`ghp_…`/`ya29.…`, and all but the first cookie pair. Affects logs and `--trace redacted` (which otherwise sends full content to Langfuse).
+15. **Unreviewed large scripts via wrappers** (`console_tools.py:62-67`): files >1 MB are only rejected for recognized interpreters; `env python big`, `timeout 60 python x`, `nice sh x`, `perl x.pl` are silently unreviewed.
+16. **Plain-mode approval accepts type-ahead** (`console_ui.py:237-265,311-322`): no `tcflush`; a pasted line `1`/`o`/`once` auto-approves the next command.
+17. **Protected-path gaps** (`docker_console.py:47-60`): `<repo>/.git` (hooks), `<repo>/tools`, user site-packages, `$XDG_RUNTIME_DIR` (D-Bus socket, same uid), `~/.local/share/keyrings`, `~/.password-store`, `~/Library/{Cookies,Mail,Messages}`.
+18. **SSRF check bypassable** (`src/agent_skills/web_research/providers.py:133-150`): `127.1`, `0x7f.0.0.1`, `10.0.0.1.` (trailing dot), `*.nip.io` pass. Low impact because the third-party provider fetches.
+19. **Lone `@` blocks input** (`personal_assistant/skill_references.py:7`): regex allows an empty name, so "meet @ 5pm" errors "Unknown skill reference @".
+20. **Invisible Unicode in approvals**: bidi overrides (U+202A–202E, U+2066–2069) and zero-width chars pass `_safe_text`.
+21. **Email approval summary omits recipient/account** when `--to` comes from `EMAIL_TO` (`console_ui.py:282-289`); calendar approvals omit account/calendar.
+22. **Calendar scripts crash on mixed aware/naive datetimes** (`gcal_utils.py:57` → uncaught `TypeError`).
+23. **Large email reads**: up to 1000×20k chars but capture stops at 1 MB (`script_executor.py:15`) → truncated JSON returned as success; 1000 sequential fetches hit the 120 s timeout and are retried as "transient".
+24. **Skill scripts drop proxy/CA env** (`script_executor.py:21` passes only PATH/HOME/LANG/LC_ALL) → Google/wiki calls fail behind corporate proxies.
+25. **One Google token with all scopes** is given to read-only scripts too.
+26. **`ATTACHMENTS_DIR` created with default umask** (`download_attachments.py:48`); O_EXCL race reports error instead of retrying; multi-address Reply-To breaks reply drafts (`create_draft_email.py:16-20`).
+27. **Agent loop robustness**: status left RUNNING if a second cancel lands during `close_resources` (`simple_agent.py:239-243`); dangling `tool_calls` if a non-cancel exception escapes `ActionRunner.run` (`simple_agent.py:313-327`) → every later request 400s until `/clear`; unbounded concurrency for batchable reads (`actions.py:134-137`).
+28. **Console correctness**: `OSError` in execute-time recheck (`console_tools.py:147`) reported as "changes unconfirmed" though no container ran; argv elements >128 KB fail with `E2BIG` misreported as "Docker transport failed"; timeout discards partial stdout (`script_executor.py:179-186`); blocking `subprocess.run` in async code (`docker_console.py:192-199,260`) freezes UI/cancel.
+29. **Transport/supply chain**: Gemini client has no explicit timeout (`gemini_client.py:54`); local provider allows plain `http://` to remote hosts (`cli_settings.py:59-61`); browser install uses pinned but unhashed requirements with no timeout (`browser_setup.py:307`); `pyproject.toml` leaves `cryptography`, `python-dotenv`, `PyYAML`, Google libs unpinned.
+30. **Filesystem**: `private_directory` silently chmods any user-named `--data-dir` to 0700 (`src/config_service/paths.py:27-31`); migration report copy follows symlinks (`paths.py:75-78`); migration `FileExistsError` shown as generic "Unable to start" (`cli.py:306-313`).
+31. **Browser worker**: an oversized request line (>32 KB) kills the worker loop (`browser_worker.py:256-262`).
+32. **Wiki markup cleanup is dead code** (`src/agent_skills/bundled/wiki/scripts/get_page.py:98-112`): the generic `[[…]]` rewrite runs before Category/File/Image removal, so `[[File:x.png|thumb|cap]]` becomes `thumb|cap`; redirects aren't followed (returns `#REDIRECT Target` as content).
+33. **Wiki scripts read unbounded responses** (`get_page.py:57,84`, `wiki/scripts/search.py:277`) — unlike `web_research/providers.py` (12 MB cap).
 
 ---
 
 ## Repository / build hygiene ✔ verified
 
 - **Tests fail on a fresh clone:** `python tools/test.py` → 577 tests, 3 errors (`test_architecture_eval`, `test_runtime_benchmark`, `test_tutorial_build`) because `evaluations/` and `.docs/` are in `.gitignore`. README links (`.docs/*.md`, `.ai/…`) are likewise dead for anyone cloning the repo. Either commit them or skip those tests when absent.
+- **Stale release check:** `tools/verify_installed_console.py:178` expects 5 skills and `:91-95` a tool set without `browser`; both now fail since browser was added.
 - `pip-audit -r requirements-lock.txt`: only `pip 26.1.2` (PYSEC-2026-3721, fixed in 26.2).
 - No secrets in git history; `.gitignore` covers `.env*`, client secrets and DBs.
 
