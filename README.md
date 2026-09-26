@@ -25,6 +25,8 @@ The console automatically gets a private session workspace, so launching from th
 
 Configuration loads from the launch directory's optional `.env`, or from `--env-file PATH`, independently of the console workspace. `--workspace` no longer selects an environment file. Both loaded environment files and an existing workspace `.env` are protected from console mounts. Process environment and encrypted configuration remain supported.
 
+The implicit launch-directory `.env` may come from an untrusted checkout, so it cannot set security-sensitive keys: data-directory and path variables (`PERSONAL_ASSISTANT_DATA_DIR`, `XDG_DATA_HOME`, `HOME`, `PATH`, `TMPDIR`, `PYTHON*`, `LD_*`/`DYLD_*`), browser executables (`BROWSER_PYTHON_PATH`, `BROWSER_EXECUTABLE_PATH`), `ATTACHMENTS_DIR`, Google OAuth/account/calendar values, `EMAIL_TO`, `DOCKER_*`, proxy/CA/TLS variables, `LANGFUSE_*` and any `*_BASE_URL`/`*_ENDPOINT`. Such keys are skipped with a warning naming them; API keys and other settings still load, and the process environment always wins. Pass `--env-file PATH` to trust a file fully. Plain `http://` local-provider URLs are accepted only for localhost and private-network hosts; use `https://` otherwise.
+
 ## Everyday use
 
 Interactive chat includes command suggestions after `/`, skill references after
@@ -58,7 +60,7 @@ Without `--workspace`, `/workspace` maps to `<data-dir>/workspaces/<session-id>`
 
 Approval waits exist only during live execution. Without an interactive handler, the command is unexecuted and the turn ends; no replay token is retained. `/clear` cancels active work and clears messages/effects/approvals and loaded skill instructions. `/settings`, `/status` and `/help` remain. Permanent and post-return approval commands are removed; historical approval files stay untouched and unused.
 
-External APIs remain trusted host skills. Sending email and creating/editing calendar events require approval. Gmail drafts and attachment downloads retain their explicit no-approval policy. Calendar deletion/cancellation is unavailable.
+External APIs remain trusted host skills. Sending email, creating/editing calendar events, opening a page in the browser, web extraction of a URL and saving long-term memory require approval, because each can carry conversation content to an outside party or into later sessions. Gmail drafts and attachment downloads retain their explicit no-approval policy. Calendar deletion/cancellation is unavailable.
 
 Set an exact outgoing email restriction when needed:
 
@@ -72,7 +74,7 @@ Unset, blank or literal `null` allows all valid recipients. A nonempty list perm
 
 Large captured output is saved as an ordinary private file. The result supplies a bounded preview, `/outputs/...` for console reads, a host path, and explicit completeness/omitted-byte metadata. Inspect saved content instead of repeating its source operation. Attachment downloads keep the configured original and copy only the requested files into session outputs. Copy/save failures preserve the original operation's outcome.
 
-Private data lives in `PERSONAL_ASSISTANT_DATA_DIR`, XDG or the OS user-data directory, overridden by `--data-dir`. Credentials are encrypted; logs, memory and output can contain plaintext business content. Files remain until deliberately deleted. Historical manifests and reports are preserved without loading them into a registry.
+Private data lives in `PERSONAL_ASSISTANT_DATA_DIR`, XDG or the OS user-data directory, overridden by `--data-dir`. Directories the assistant creates are owner-only (0700); an existing directory named with `--data-dir` keeps its permissions and triggers a warning if other users can access it. Credentials are encrypted; logs, memory and output can contain plaintext business content. Files remain until deliberately deleted. Historical manifests and reports are preserved without loading them into a registry.
 
 ```bash
 rtk proxy personal-assistant --workspace /path/to/checkout --data-dir /path/to/new-data --migrate-data-from /path/to/checkout/src/data
@@ -90,7 +92,7 @@ rtk proxy python .docs/tutorial/build.py --check
 
 The isolated suite uses synthetic accounts/providers; the separate Docker release check uses actual local containers and disposable files. macOS Docker Desktop/Linux arm64 is validated. Linux-host support remains unverified; native Windows, macOS SDK/desktop execution and console networking are outside scope. Docker limits exposure but is not proof against every kernel/container vulnerability, and approved writable files can still be damaged.
 
-See [architecture](.docs/03-architecture.md), [console contract](.docs/09-docker-console.md), [CLI guide](.docs/14-cli-user-guide.md), [superseding decision](.docs/decisions/006-conversation-and-docker-console.md), [implementation ledger](.ai/agent-runtime-simplification-plan.md), and [offline tutorial](.docs/tutorial/index.html). Optional Langfuse tracing remains explicit with `--trace metadata` or `--trace redacted`.
+The `.docs/`, `.ai/` and `evaluations/` directories are maintained locally and are not included in the public repository, so the links below and the tutorial check work only in a full working copy; the tests that depend on them are skipped when they are absent. See [architecture](.docs/03-architecture.md), [console contract](.docs/09-docker-console.md), [CLI guide](.docs/14-cli-user-guide.md), [superseding decision](.docs/decisions/006-conversation-and-docker-console.md), [implementation ledger](.ai/agent-runtime-simplification-plan.md), and [offline tutorial](.docs/tutorial/index.html). Optional Langfuse tracing remains explicit with `--trace metadata` or `--trace redacted`.
 
 ## Web providers and browser
 

@@ -20,7 +20,7 @@ class TestCLIDataOwnership(unittest.IsolatedAsyncioTestCase):
             ])
             configuration = ConfigService(data / "agent_config.db")
             with patch("personal_assistant.cli.ConfigService", return_value=configuration), patch(
-                "personal_assistant.cli.load_dotenv"
+                "personal_assistant.cli._load_environment"
             ) as dotenv, patch(
                 "personal_assistant.cli._prepare_runtime_configuration",
                 return_value=RuntimeSettings(provider="local", model="fixture"),
@@ -28,7 +28,7 @@ class TestCLIDataOwnership(unittest.IsolatedAsyncioTestCase):
                 "personal_assistant.cli._initialize_session_ui"
             ), patch("personal_assistant.cli._run_conversation", new=AsyncMock(return_value=0)):
                 self.assertEqual(await _run(args), 0)
-            dotenv.assert_called_once_with(Path.cwd() / ".env", override=False)
+            dotenv.assert_called_once_with(Path.cwd() / ".env", explicit=False)
             self.assertEqual(runtime.call_args.kwargs["workspace_root"], workspace)
             self.assertFalse((data / "agent_memory.db").exists())
             with self.assertRaisesRegex(RuntimeError, "closed"):
@@ -48,7 +48,7 @@ class TestCLIDataOwnership(unittest.IsolatedAsyncioTestCase):
                     arguments[:0] = ["--env-file", str(env)]
                 args = build_parser().parse_args(arguments)
                 with patch("pathlib.Path.cwd", return_value=root), patch(
-                    "personal_assistant.cli.load_dotenv"
+                    "personal_assistant.cli._load_environment"
                 ) as dotenv, patch(
                     "personal_assistant.cli._prepare_runtime_configuration", return_value=RuntimeSettings(),
                 ), patch(
@@ -59,7 +59,7 @@ class TestCLIDataOwnership(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(await _run(args), 0)
                 self.assertIsNone(runtime.call_args.kwargs["workspace_root"])
                 self.assertEqual(runtime.call_args.kwargs["env_file"], env)
-                dotenv.assert_called_once_with(env, override=False)
+                dotenv.assert_called_once_with(env, explicit=explicit_env)
 
     async def test_explicit_missing_env_file_reports_startup_error(self):
         with tempfile.TemporaryDirectory() as tmp:

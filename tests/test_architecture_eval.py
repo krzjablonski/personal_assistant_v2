@@ -1,10 +1,15 @@
 """Offline evaluations must exercise real runtime gates and label their limits."""
+import importlib.util
 import unittest
 from unittest.mock import patch
 
-from evaluations.architecture import run_suite
+# evaluations/ is not part of the public repository; skip cleanly when absent.
+HAS_EVALUATIONS = importlib.util.find_spec("evaluations") is not None
+if HAS_EVALUATIONS:
+    from evaluations.architecture import run_suite
 
 
+@unittest.skipUnless(HAS_EVALUATIONS, "evaluations/ is not included in this checkout")
 class ArchitectureEvaluationTests(unittest.IsolatedAsyncioTestCase):
     async def test_retained_runtime_satisfies_all_fixture_constraints_without_network(self):
         with patch("socket.socket.connect", side_effect=AssertionError("Network forbidden")):

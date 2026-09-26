@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import sys
 from dataclasses import dataclass, replace
 from getpass import getpass
@@ -37,6 +38,25 @@ SETTING_KEYS = {
     "base_url": "cli.local_base_url",
     "context_window": "cli.local_context_window",
 }
+_LOCAL_NAME_SUFFIXES = (".localhost", ".local", ".lan", ".internal", ".home.arpa")
+
+
+def _is_local_network_host(host: str | None) -> bool:
+    """Report whether plain HTTP to this host stays on the machine or a private network.
+
+    Accept loopback and private/link-local IP literals, ``localhost``, single-label
+    names and common local-only suffixes; anything else must use HTTPS.
+    """
+    if not host:
+        return False
+    host = host.rstrip(".").lower()
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host == "localhost" or "." not in host or host.endswith(_LOCAL_NAME_SUFFIXES)
+    return (address.is_loopback or address.is_private or address.is_link_local) and not address.is_unspecified
+
+
 @dataclass(frozen=True)
 class RuntimeSettings:
     provider: str = "openai"
@@ -60,6 +80,10 @@ class RuntimeSettings:
             parsed = urlparse(self.base_url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("Local base URL must be an HTTP(S) URL")
+            if parsed.scheme == "http" and not _is_local_network_host(parsed.hostname):
+                raise ValueError(
+                    "Local base URL must use https:// unless it targets localhost or a private network host"
+                )
 
 
 def _saved_int(

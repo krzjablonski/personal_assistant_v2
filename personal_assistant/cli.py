@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import re
+import sys
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from agent.agent_event import AgentEventType
 from config_service import ConfigService
@@ -33,6 +36,56 @@ from personal_assistant.services.skills_registry import SKILL_CATALOG
 from personal_assistant.skill_references import SkillReferenceError
 
 
+# Keys an implicit launch-directory .env may not set: they redirect host
+# execution, private data, integration identities or model endpoints. An
+# explicit --env-file is trusted and may set them.
+_IMPLICIT_ENV_DENYLIST = frozenset({
+    "PERSONAL_ASSISTANT_DATA_DIR", "XDG_DATA_HOME", "HOME", "TMPDIR", "PATH",
+    "BROWSER_PYTHON_PATH", "BROWSER_EXECUTABLE_PATH", "ATTACHMENTS_DIR",
+    "GOOGLE_OAUTH_CLIENT_JSON", "GOOGLE_OAUTH_TOKEN_JSON", "GOOGLE_ACCOUNT_EMAIL",
+    "GOOGLE_CALENDAR_ID", "EMAIL_TO", "SSH_AUTH_SOCK", "BROWSER",
+})
+_IMPLICIT_ENV_DENIED_PATTERN = re.compile(
+    r"(_BASE_URL|_API_BASE|_ENDPOINT|_PROXY)$|^(PYTHON|LD_|DYLD_|DOCKER_|SSL_|REQUESTS_CA|CURL_CA|LANGFUSE_)"
+)
+
+
+def _implicit_env_denied(key: str) -> bool:
+    """Report whether an implicit launch-directory .env may not set this key."""
+    upper = key.upper()
+    return upper in _IMPLICIT_ENV_DENYLIST or bool(_IMPLICIT_ENV_DENIED_PATTERN.search(upper))
+
+
+def _load_environment(env_file: Path, *, explicit: bool) -> list[str]:
+    """Load configuration from an environment file without overriding the process environment.
+
+    An explicit --env-file is loaded in full. The implicit launch-directory .env
+    may come from an untrusted checkout, so security-sensitive keys are ignored
+    with a warning; returns the ignored key names.
+    """
+    if explicit:
+        load_dotenv(env_file, override=False)
+        return []
+    if not env_file.is_file():
+        return []
+    ignored = []
+    for key, value in dotenv_values(env_file, interpolate=False).items():
+        if value is None or key in os.environ:
+            continue
+        if _implicit_env_denied(key):
+            if value:
+                ignored.append(key)
+            continue
+        os.environ[key] = value
+    if ignored:
+        print(
+            f"Warning: ignored security-sensitive settings in {env_file}: {', '.join(sorted(ignored))}. "
+            "Use --env-file to trust this file.",
+            file=sys.stderr,
+        )
+    return ignored
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define command-line options for chat, one-shot requests, providers, skills, and Google connection."""
     parser = argparse.ArgumentParser(description="Run the personal assistant.", allow_abbrev=False)
@@ -49,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url")
     parser.add_argument("--context-window", type=int)
     parser.add_argument("--workspace", type=Path, help="Explicit writable console folder (defaults to managed session storage)")
-    parser.add_argument("--env-file", type=Path, help="Configuration environment file (defaults to .env in the launch directory; never grants console access)")
+    parser.add_argument("--env-file", type=Path, help="Trusted configuration environment file (defaults to .env in the launch directory, which cannot set path, executable, account or endpoint keys; never grants console access)")
     parser.add_argument("--data-dir", type=Path, help="Private mutable data directory (defaults to the user data directory)")
     parser.add_argument("--migrate-data-from", type=Path, metavar="LEGACY_DATA_DIR", help="Copy legacy data to a new --data-dir and exit; preserve the source")
     parser.add_argument("--max-iterations", type=int)
@@ -265,10 +318,13 @@ async def _run(args: argparse.Namespace) -> int:
     env_file = (args.env_file or Path.cwd() / ".env").expanduser().absolute()
     if args.env_file is not None and not env_file.is_file():
         raise ValueError(f"Environment file does not exist: {env_file}")
-    load_dotenv(env_file, override=False)
+    _load_environment(env_file, explicit=args.env_file is not None)
     data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
     if args.migrate_data_from is not None:
-        migrate_legacy_data(args.migrate_data_from, data_dir, report_path=workspace / ".ai" / "inbox-triage.md")
+        try:
+            migrate_legacy_data(args.migrate_data_from, data_dir, report_path=workspace / ".ai" / "inbox-triage.md")
+        except (OSError, TimeoutError) as exc:
+            raise ValueError(f"Data migration failed: {exc}") from exc
         print(f"Data copied to {data_dir}. Original data retained at {args.migrate_data_from}.")
         return 0
     legacy = workspace / "src" / "data"

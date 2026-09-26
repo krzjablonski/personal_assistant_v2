@@ -1,7 +1,13 @@
+import importlib.util
 import unittest
-from evaluations.runtime_benchmark import run_benchmarks
+
+# evaluations/ is not part of the public repository; skip cleanly when absent.
+HAS_EVALUATIONS = importlib.util.find_spec("evaluations") is not None
+if HAS_EVALUATIONS:
+    from evaluations.runtime_benchmark import run_benchmarks
 
 
+@unittest.skipUnless(HAS_EVALUATIONS, "evaluations/ is not included in this checkout")
 class RuntimeBenchmarkTests(unittest.TestCase):
     def test_benchmark_checks_growth_counts_without_timing_thresholds(self):
         report = run_benchmarks(sizes=(4, 8), repeats=1)

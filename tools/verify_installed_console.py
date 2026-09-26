@@ -45,8 +45,8 @@ async def installed_smoke(site: Path) -> None:
             if len(self.calls) == 1:
                 names = {tool.name for tool in request["tools"]}
                 assert names == {"run_command", "load_skill_instructions", "read_skill_resource",
-                                 "run_skill_command", "save_memory", "recall_memory"}, names
-                for skill in ("email", "calendar", "web-research", "wiki", "memory"):
+                                 "run_skill_command", "save_memory", "recall_memory", "browser"}, names
+                for skill in ("email", "calendar", "web-research", "wiki", "memory", "browser"):
                     assert skill in request["system"]
                 message = Message("assistant", tool_calls=[ToolCall("wheel-command", "run_command",
                                   {"argv": ["python", "-"], "stdin": code})])
@@ -130,7 +130,7 @@ def verify() -> None:
             str(next((root / "wheels").glob("*.whl"))))
         env["PYTHONPATH"] = str(site)
         assert "--workspace" in run("-m", "personal_assistant", "--help")
-        assert len(run("-m", "personal_assistant", "--list-skills").splitlines()) == 5
+        assert len(run("-m", "personal_assistant", "--list-skills").splitlines()) == 6
         smoke = root / "smoke.py"
         shutil.copy2(__file__, smoke)
         print(run(str(smoke), "--installed", str(site)))
