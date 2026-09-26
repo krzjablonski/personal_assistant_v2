@@ -20,6 +20,24 @@ _ASSIGNMENT = re.compile(
     r'''(?P<value>\[REDACTED\]|"[^"]*"|'[^']*'|[^\s,;&}\]]+)'''
 )
 _BEARER = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
+# Header forms mask the scheme too: "Basic"/"token" alone does not reveal the
+# credential, but a partial mask invites reading the remaining text as safe.
+_AUTH_HEADER = re.compile(
+    r"""(?i)(?<![A-Za-z0-9_-])(?P<key>["']?(?:proxy-)?authorization["']?\s*[:=]\s*)(?!\[REDACTED\])"""
+    r"""(?P<value>"[^"]*"|'[^']*'|(?:basic|bearer|digest|token|negotiate|ntlm|apikey|aws4-hmac-sha256)\s+[^\s,;&}\]"']+|[^\s,;&}\]"']+)"""
+)
+# Every pair in a Cookie/Set-Cookie header line is a credential.
+_COOKIE_HEADER = re.compile(r"(?i)(?<![A-Za-z0-9_-])((?:set-)?cookie\s*:\s*)[^\r\n\"']+")
+_FLAG = re.compile(
+    r"""(?<![A-Za-z0-9_-])(?P<flag>--?[A-Za-z][A-Za-z0-9_.-]*)(?P<sep>=|\s+(?!-))"""
+    r"""(?P<value>\[REDACTED\]|"[^"]*"|'[^']*'|[^\s"']+)"""
+)
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^/\s:@]*):[^/\s@]+@")
+_KNOWN_TOKENS = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|ya29\.[A-Za-z0-9_-]{10,}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})"
+)
 _QUERY = re.compile(r"([?&])([A-Za-z0-9_-]+)=([^&\s]+)")
 
 
@@ -49,7 +67,17 @@ def redact_text(text: str) -> str:
         chunks.extend((text[cursor:start], "[REDACTED]"))
         cursor = end
     text = "".join(chunks) + text[cursor:]
+    text = _AUTH_HEADER.sub(lambda match: f"{match['key']}[REDACTED]", text)
+    text = _COOKIE_HEADER.sub(r"\1[REDACTED]", text)
     text = _BEARER.sub(r"\1[REDACTED]", text)
+    text = _URL_USERINFO.sub(r"\1:[REDACTED]@", text)
+    text = _FLAG.sub(
+        lambda match: (
+            f"{match['flag']}{match['sep']}[REDACTED]"
+            if is_secret_key(match["flag"].lstrip("-")) else match.group()
+        ),
+        text,
+    )
     text = _ASSIGNMENT.sub(
         lambda match: (
             f"{match['key']}{match['sep']}[REDACTED]"
@@ -57,6 +85,7 @@ def redact_text(text: str) -> str:
         ),
         text,
     )
+    text = _KNOWN_TOKENS.sub("[REDACTED]", text)
     return _QUERY.sub(
         lambda match: (
             f"{match[1]}{match[2]}=[REDACTED]"

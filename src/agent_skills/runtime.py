@@ -236,6 +236,11 @@ class SkillRuntime:
             scope["google_account"] = provided.get("GOOGLE_ACCOUNT_EMAIL") or "unavailable (reconnect to identify account)"
         if "GOOGLE_CALENDAR_ID" in environment:
             scope["environment"]["GOOGLE_CALENDAR_ID"] = env.get("GOOGLE_CALENDAR_ID") or "primary"
+        if "EMAIL_TO" in environment:
+            # Show the effective recipient even when the script falls back to EMAIL_TO.
+            explicit = _last_option(argv[1:], "--to")
+            scope["recipients"] = (explicit if explicit is not None
+                                   else env.get("EMAIL_TO") or "none (no --to and EMAIL_TO unset)")
 
         async def execute() -> ToolResult:
             # Recheck mutable filesystem state at the execution boundary.
@@ -356,9 +361,9 @@ class SkillRuntime:
         mutating = spec is None or spec.safety != "read-only"
         if mutating and not result.timed_out:
             if result.exit_code == 0:
+                # A fixed summary: script output is untrusted and stays in the tool result.
                 base_metadata["confirmed_changes"] = [
-                    f"Skill command '{skill_name}/{script_path}' completed with exit 0. "
-                    f"Reported output (bounded, not independently verified): {result.stdout[:COMMAND_STDERR_TAIL_CHARS]}"
+                    f"Skill command '{skill_name}/{script_path}' completed with exit 0 (output in tool result)."
                 ]
             else:
                 # A normal failure exit can follow a submitted external request.
@@ -421,15 +426,35 @@ class SkillRuntime:
             )
             return wrapped
 
+        # Lead with the notice: output limits can cut a trailing notice off.
+        notice = result.capture_notice().strip()
         wrapped = ToolResult(
             tool_name="run_skill_command",
             parameters=params,
-            result=result.stdout + result.capture_notice(),
+            result=f"{notice}\n\n{result.stdout}" if notice else result.stdout,
             is_error=False,
             metadata=dict(base_metadata),
             outcome=ToolOutcome.USABLE,
         )
         return wrapped
+
+
+def _last_option(args: list[str], name: str) -> str | None:
+    """Return the final value of an option, following argparse's last-value-wins semantics."""
+    value = None
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--":
+            break
+        if item == name and index + 1 < len(args):
+            value = args[index + 1]
+            index += 2
+            continue
+        if item.startswith(name + "="):
+            value = item[len(name) + 1:]
+        index += 1
+    return value
 
 
 def _requires_approval(spec: ScriptSpec | None) -> bool:

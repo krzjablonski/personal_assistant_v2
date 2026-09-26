@@ -38,7 +38,10 @@ class SkillEffectTests(unittest.IsolatedAsyncioTestCase):
                     field = "confirmed_changes" if exit_code == 0 else "uncertain_changes"
                     self.assertTrue(result.metadata.get(field), result.metadata)
                     if exit_code == 0:
-                        self.assertIn("record-42", " ".join(result.metadata[field]))
+                        # Untrusted stdout stays in the tool result, never in effect context.
+                        self.assertNotIn("record-42", " ".join(result.metadata[field]))
+                        self.assertIn("output in tool result", " ".join(result.metadata[field]))
+                        self.assertIn("record-42", result.result)
 
     async def test_rejected_changed_script_does_not_claim_possible_execution(self):
         action = self.runtime.prepare_command("toolkit", ["scripts/exec.py"])

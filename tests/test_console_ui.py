@@ -225,7 +225,7 @@ class TestConsoleUI(unittest.TestCase):
 
 
 class TestConsoleActivity(unittest.IsolatedAsyncioTestCase):
-    async def test_enhanced_approval_preserves_redacted_full_scope(self):
+    async def test_enhanced_approval_shows_exact_unredacted_scope(self):
         output = TtyBuffer()
         store = ToolApprovalStore()
         request = store.request("run_command", {"argv": ["python", "-"], "stdin": "print(42)",
@@ -240,7 +240,8 @@ class TestConsoleActivity(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("print(42)", summary)
                 self.assertIn("/workspace", summary)
                 self.assertIn('"network": "none"', details)
-                self.assertNotIn("private-secret", details + summary)
+                # Approval never masks model-authored scope; logs redact separately.
+                self.assertIn("private-secret", details)
                 legacy.assert_not_called()
         self.assertEqual(store.get(request.approval_id).status, "approved")
 

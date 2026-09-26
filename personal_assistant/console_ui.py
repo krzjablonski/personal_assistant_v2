@@ -20,13 +20,16 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from tool_framework.approval import ToolApprovalRequest, ToolApprovalStore
-from message_logger.redaction import redact_text, redact_value
 from personal_assistant.cli_input import ApprovalInput, supports_interactive_input
 
 
 _T = TypeVar("_T")
-_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# C0/C1 controls (keeping newline and tab), ESC included, plus invisible
+# format characters: bidi embeddings/overrides/isolates, zero-width
+# characters, line/paragraph separators and the byte-order mark.
+_UNSAFE_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]"
+)
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
@@ -60,9 +63,55 @@ _VISIBLE_EVENTS = {
 }
 
 
+def _escape_character(match: re.Match) -> str:
+    """Render one unsafe character as a visible escape."""
+    code = ord(match.group())
+    if code == 0x0D:
+        return "\\r"
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+
+
 def _safe_text(value: object) -> str:
-    """Remove recognized ANSI escapes and control characters before rendering external text."""
-    return _CONTROL_RE.sub("", _ANSI_RE.sub("", str(value)))
+    """Render terminal controls and invisible characters as visible escapes.
+
+    Deleting them would misrepresent content: a lone carriage return is a line
+    break to Python and a shell, so dropping it can make live code look commented out.
+    """
+    return _UNSAFE_RE.sub(_escape_character, str(value))
+
+
+def _has_hidden_characters(value: object) -> bool:
+    """Report whether any string in a scope needs escapes for controls or invisible characters."""
+    if isinstance(value, str):
+        return bool(_UNSAFE_RE.search(value))
+    if isinstance(value, dict):
+        return any(_has_hidden_characters(key) or _has_hidden_characters(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_has_hidden_characters(item) for item in value)
+    return False
+
+
+def _discard_type_ahead() -> None:
+    """Drop pending terminal input so earlier keystrokes cannot answer a new prompt."""
+    try:
+        import termios
+
+        if sys.stdin.isatty():
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        # Windows, pipes, mocked or closed stdin: nothing buffered to discard.
+        pass
+
+
+_SCOPE_LABELS = (("recipients", "To"), ("google_account", "Account"), ("calendar", "Calendar"))
+
+
+def _scope_summary(arguments: dict) -> list[str]:
+    """Return recipient/account/calendar lines present anywhere a scope names them."""
+    environment = arguments.get("environment") if isinstance(arguments.get("environment"), dict) else {}
+    values = {**({"calendar": environment["GOOGLE_CALENDAR_ID"]} if "GOOGLE_CALENDAR_ID" in environment else {}),
+              **arguments}
+    return [f"{label}: {_safe_text(values[key])}" for key, label in _SCOPE_LABELS if values.get(key) is not None]
 
 
 def _single_line(value: object) -> str:
@@ -273,24 +322,37 @@ class ConsoleUI:
 
         Record the decision in the approval store and retry invalid or unavailable choices.
         """
-        arguments = redact_value(request.arguments)
+        # Approval shows the exact model-authored scope: masking credential-like
+        # patterns here could hide code or message content. Logs redact separately.
+        arguments = request.arguments
         command = arguments.get("argv", arguments.get("command"))
         if isinstance(command, list):
             action = shlex.join(str(part) for part in command)
         else:
             action = request.tool_name
         scope = _safe_text(json.dumps(arguments, ensure_ascii=False, indent=2, default=str))
+        warning = ("Warning: contains control or invisible characters, shown as \\r, \\xNN or \\uNNNN escapes."
+                   if _has_hidden_characters(arguments) else "")
+        unreviewed = arguments.get("unreviewed_files") or []
         if not self.plain and self.stream is sys.stdout and supports_interactive_input():
             if isinstance(command, list):
-                summary = f"Action: {_safe_text(action)}\nReason: {_safe_text(redact_text(request.reason))}"
+                summary = f"Action: {_safe_text(action)}\nReason: {_safe_text(request.reason)}"
+                for line in _scope_summary(arguments):
+                    summary += "\n" + line
                 if arguments.get("cwd") is not None:
                     summary += f"\nDirectory: {_safe_text(arguments['cwd'])}"
                 if arguments.get("stdin") is not None:
                     summary += f"\nStdin / code:\n{_safe_text(arguments['stdin'])}"
                 if arguments.get("reviewed_files"):
                     summary += "\nReviewed files: inspect full action details (d)."
+                if unreviewed:
+                    summary += "\nUNREVIEWED files (over 1 MB, not shown): " + ", ".join(
+                        _safe_text(item.get("path")) for item in unreviewed)
             else:
-                summary = f"Action: {_single_line(action)}\nReason: {_safe_text(redact_text(request.reason))}\n{scope}"
+                summary = f"Action: {_single_line(action)}\nReason: {_safe_text(request.reason)}\n{scope}"
+            if warning:
+                summary += "\n" + warning
+            _discard_type_ahead()
             self._write("\r\033[2K")
             allowed = await ApprovalInput(summary, scope, color=self.color).read()
             if allowed:
@@ -303,11 +365,14 @@ class ConsoleUI:
         self._write(
             "\r\033[2K\nApproval required\n"
             f"  Action: {_single_line(action)}\n"
-            f"  Reason: {_single_line(redact_text(request.reason))}\n"
-            f"  Resolved action:\n{scope}\n"
+            f"  Reason: {_single_line(request.reason)}\n"
+            + "".join(f"  {line}\n" for line in _scope_summary(arguments))
+            + (f"  {warning}\n" if warning else "")
+            + f"  Resolved action:\n{scope}\n"
             "  1. Allow once\n"
             "  2. Deny\n"
         )
+        _discard_type_ahead()
         while True:
             try:
                 choice = (await self._read_input()).strip().casefold()

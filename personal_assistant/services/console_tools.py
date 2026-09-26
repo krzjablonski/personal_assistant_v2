@@ -12,39 +12,57 @@ import re
 from pathlib import Path, PurePosixPath
 
 from personal_assistant.services.docker_console import DockerConsole, ConsoleCancelled, ConsoleResult, MAX_TIMEOUT
-from tool_framework.approval import sanitized_approval_arguments
 from tool_framework.i_tool import ITool, PreparedAction, ToolPolicy, ToolResult
 from tool_framework.output_files import save_output
 from tool_framework.tool_executor import ToolExecutionCancelled
 from config_service.paths import private_directory
 
 INPUT_BYTES = 1_000_000
+# Linux MAX_ARG_STRLEN (131072) includes the terminating NUL.
+ARGUMENT_BYTES = 131_071
 
 
-def reviewed_files(argv: list[str], cwd: str, mounts: tuple[dict, ...]) -> list[dict]:
+def container_path(cwd: str, operand: str) -> PurePosixPath:
+    """Join an operand to cwd the way the kernel reads it, keeping '..' for symlink resolution.
+
+    Repeated slashes (including a leading '//') and '.' segments are purely
+    lexical, so collapsing them never changes which file is opened.
+    """
+    joined = posixpath.join(cwd, operand)
+    return PurePosixPath("/" + "/".join(part for part in joined.split("/") if part not in ("", ".")))
+
+
+def reviewed_files(argv: list[str], cwd: str, mounts: tuple[dict, ...],
+                   unreviewed: list[dict] | None = None) -> list[dict]:
     """Inspect direct text-file operands without interpreting arbitrary programs.
 
     Execute original paths to preserve __file__, imports, and shell $0 semantics.
     Rechecking these snapshots detects edits, not filesystem races or changes in
-    imported code or filenames embedded inside shell/code expressions.
+    imported code or filenames embedded inside shell/code expressions. Oversized
+    operands that may still execute are appended to ``unreviewed`` when given.
     """
     files = []
     seen = set()
     reviewed_bytes = 0
     interpreter = PurePosixPath(argv[0]).name
     file_interpreter = bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|sh|bash|dash", interpreter))
+    targets = [PurePosixPath(mount["target"]) for mount in mounts]
     for index, operand in enumerate(argv):
         # Keep '..' until the filesystem resolves symlinks, matching chdir/open.
-        container_path = PurePosixPath(posixpath.join(cwd, operand))
-        if container_path in seen:
+        path = container_path(cwd, operand)
+        if path in seen:
             continue
-        seen.add(container_path)
-        for mount in mounts:
-            target = PurePosixPath(mount["target"])
-            if not container_path.is_relative_to(target):
+        seen.add(path)
+        if ".." in path.parts and not any(path.is_relative_to(target) for target in targets):
+            # e.g. /tmp/../workspace/x.py: container symlinks outside the mounts
+            # decide where '..' lands, so the reviewed file could differ from the opened one.
+            raise ValueError("Operands must not reach mounted directories through '..' from outside them; "
+                             "use a normalized container path such as /workspace/script.py.")
+        for mount, target in zip(mounts, targets):
+            if not path.is_relative_to(target):
                 continue
             root = Path(mount["source"])
-            original = root / str(container_path.relative_to(target))
+            original = root / str(path.relative_to(target))
             try:
                 resolved = original.resolve()
                 exists = resolved.is_file()
@@ -64,6 +82,11 @@ def reviewed_files(argv: list[str], cwd: str, mounts: tuple[dict, ...]) -> list[
                 if (index == 0 or data.startswith(b"#!") or resolved.suffix in {".py", ".sh"}
                         or (file_interpreter and not inline_before)):
                     raise ValueError("Generated script review is limited to 1 MB; reduce or split the script before approval.")
+                if unreviewed is not None:
+                    # Wrappers (env, timeout, nice) and other interpreters may still run it.
+                    unreviewed.append({"path": str(path), "host_path": str(resolved), "bytes": resolved.stat().st_size,
+                                       "reason": "Larger than the 1 MB review limit; content not shown and not rechecked. "
+                                                 "If a program executes or interprets it, it runs unreviewed."})
                 continue
             reviewed_bytes += len(data)
             if reviewed_bytes > INPUT_BYTES or len(files) >= 128:
@@ -75,7 +98,7 @@ def reviewed_files(argv: list[str], cwd: str, mounts: tuple[dict, ...]) -> list[
                 encoding = "latin-1 (byte-preserving view)"
                 content = data.decode("latin-1")
             stat = resolved.stat()
-            files.append({"path": str(container_path), "host_path": str(resolved), "content": content, "encoding": encoding,
+            files.append({"path": str(path), "host_path": str(resolved), "content": content, "encoding": encoding,
                           "sha256": hashlib.sha256(data).hexdigest(),
                           "identity": [stat.st_dev, stat.st_ino, stat.st_mode]})
     return files
@@ -110,11 +133,15 @@ class RunCommandTool(ITool):
             raise ValueError("argv must not contain NUL bytes.")
         if sum(len(value.encode("utf-8")) for value in argv) > INPUT_BYTES:
             raise ValueError("argv exceeds the 1 MB input limit.")
+        if any(len(value.encode("utf-8")) > ARGUMENT_BYTES for value in argv):
+            raise ValueError("An argv element exceeds the 128 KB per-argument Linux limit; pass large code or data through stdin instead.")
         if len(args.get("stdin", "").encode("utf-8")) > INPUT_BYTES:
             raise ValueError("stdin exceeds the 1 MB input limit.")
         cwd = args.get("cwd", "/workspace")
         if not PurePosixPath(cwd).is_absolute() or "\x00" in cwd:
             raise ValueError("cwd must be an absolute container path without NUL bytes.")
+        if ".." in PurePosixPath(cwd).parts:
+            raise ValueError("cwd must not contain '..' segments; use a normalized container path such as /workspace/project.")
         timeout = args.get("timeout", 30)
         if isinstance(timeout, bool) or not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT:
             raise ValueError(f"timeout must be a finite number greater than zero and at most {MAX_TIMEOUT} seconds.")
@@ -127,20 +154,21 @@ class RunCommandTool(ITool):
         self.console.prepare_workspace()
         private_directory(self.console.outputs)
         environment = self.console.prepare_environment()
-        files = reviewed_files(execution["argv"], execution["cwd"], environment.mounts)
+        unreviewed: list[dict] = []
+        files = reviewed_files(execution["argv"], execution["cwd"], environment.mounts, unreviewed)
         scope = {**deepcopy(execution), **environment.approval_details(),
                  "executable": execution["argv"][0],
                  "reviewed_files": files,
+                 **({"unreviewed_files": unreviewed} if unreviewed else {}),
                  "mutable_code_scope": "Direct file operands up to 1 MB are inspected and rechecked; non-UTF-8 bytes use a Latin-1 review view. Original paths execute to preserve imports and path semantics. Imports, large data, and paths embedded in code remain live inputs; this is not a filesystem-race-proof snapshot."}
         review = json.dumps(scope, ensure_ascii=False, indent=2)
         policy = self.policy
-        if len(review) > 8000 or sanitized_approval_arguments(scope) != scope:
+        if len(review) > 8000:
             saved = save_output(self.console.outputs, review, suffix=".json")
             # Presentation paths vary across preparations; they must not change
             # the exact execution identity used to remember a denial.
             policy = replace(policy, approval_reason=policy.approval_reason +
                              " Read before allowing. Full command/code review: " + saved["host_output_path"])
-        scope = sanitized_approval_arguments(scope)
 
         async def execute() -> ToolResult:
             try:
@@ -148,8 +176,9 @@ class RunCommandTool(ITool):
                     raise ValueError("Reviewed file contents or identity changed; prepare again and obtain fresh approval.")
                 result = await self.console.execute(environment, execution["argv"],
                     stdin=execution["stdin"], cwd=execution["cwd"], timeout=execution["timeout"])
-            except ValueError as error:
-                # Docker validates mutable scope before it creates a container.
+            except (ValueError, OSError) as error:
+                # The recheck and Docker's scope validation both run before any
+                # container exists; execute() reports post-start failures itself.
                 return ToolResult(self.name, execution, f"Command not executed: {error}", True, {"not_executed": True})
             except ConsoleCancelled as error:
                 raise ToolExecutionCancelled(self._result(execution, error.result)) from error
@@ -182,5 +211,7 @@ class RunCommandTool(ITool):
             metadata["confirmed_changes"] = ["Console process completed with exit code zero; workspace effects and the requested outcome still require inspection when relevant."]
         if not result.cleanup_verified:
             status += f" Container cleanup could not be verified; check {result.container_name} with local Docker."
-        body = f"{status}\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}" + process.capture_notice()
+        notice = process.capture_notice().strip()
+        # Lead with the notice so output limits cannot cut it off.
+        body = (notice + "\n" if notice else "") + f"{status}\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
         return ToolResult(self.name, args, body, failed, metadata)

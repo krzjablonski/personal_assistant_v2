@@ -13,8 +13,6 @@ from datetime import datetime
 from typing import Any, Literal
 from time import monotonic
 
-from message_logger.redaction import redact_value
-
 
 _BINDING_KEY = secrets.token_bytes(32)
 
@@ -26,11 +24,14 @@ def private_scope_binding(value: Any) -> str:
 
 
 def sanitized_approval_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Keep readable action scope while binding any masked credential values."""
-    cleaned = redact_value(arguments)
-    if cleaned != arguments:
-        cleaned["private_scope_binding"] = private_scope_binding(arguments)
-    return cleaned
+    """Return an exact copy of the scope the human approves.
+
+    Model-authored code, argv and message bodies are never masked here: a
+    credential-shaped pattern can otherwise hide executable content. Private
+    configuration must stay out of scopes (use private_scope_binding); logs and
+    traces apply their own redaction.
+    """
+    return deepcopy(arguments)
 
 
 ApprovalStatus = Literal["pending", "approved", "denied", "consumed", "unavailable", "cancelled"]
@@ -50,15 +51,12 @@ class ToolApprovalRequest:
 
 
 def build_approval_id(tool_name: str, arguments: dict[str, Any]) -> str:
-    """Return a deterministic identifier tying approval to a tool name and argument payload."""
-    payload = json.dumps(
-        {"tool_name": tool_name, "arguments": arguments},
-        sort_keys=True,
-        ensure_ascii=False,
-        default=str,
-    )
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-    return f"approval_{digest}"
+    """Return a session-deterministic identifier tying approval to a tool name and argument payload.
+
+    Keyed with the session binding key so an identifier never acts as a plain
+    hash of unredacted scope that could be guessed offline from logs.
+    """
+    return f"approval_{private_scope_binding({'tool_name': tool_name, 'arguments': arguments})[:16]}"
 
 
 def _observe_handler_completion(task: asyncio.Task) -> None:

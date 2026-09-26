@@ -18,7 +18,13 @@ CLEANUP_TIMEOUT_SECONDS = 1.0
 # Baseline environment variables copied from the parent process when present.
 # Everything else must be supplied through the per-script ``environment``
 # allowlist so bundled CLI scripts never inherit the full parent environment.
-_PASSTHROUGH_ENV = ("PATH", "HOME", "LANG", "LC_ALL")
+# Proxy and CA settings carry no credentials of their own here and are needed
+# for integrations behind corporate proxies or TLS inspection.
+_PASSTHROUGH_ENV = (
+    "PATH", "HOME", "LANG", "LC_ALL",
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+)
 
 
 @dataclass(frozen=True)
@@ -58,7 +64,8 @@ class ScriptResult:
             "\n\n[Output capture incomplete: "
             f"stdout omitted {self.stdout_bytes_omitted} bytes; "
             f"stderr omitted {self.stderr_bytes_omitted} bytes. "
-            "This is partial evidence, not a complete structured response.]"
+            "This is partial evidence, not a complete structured response; "
+            "narrow the request (for example, fewer results) to obtain complete output.]"
         )
 
 
@@ -99,7 +106,7 @@ def build_subprocess_env(
 ) -> dict[str, str]:
     """Construct a minimal subprocess environment.
 
-    Only ``PATH``/``HOME``/``LANG``/``LC_ALL`` from the parent process plus the
+    Only ``PATH``/``HOME``/``LANG``/``LC_ALL`` and proxy/CA settings from the parent process plus the
     allowlisted variables (resolved from ``env_provider``, never blindly from
     ``os.environ``) are included.
     """
@@ -130,7 +137,7 @@ async def run_script(
     """Run a confined Python skill script with its permitted environment and bounded output capture.
 
     Return exit status and separate stdout/stderr text. On timeout, terminate
-    the process group and return a timed-out result without partial output.
+    the process group and return a timed-out result with the output captured so far.
     """
     resolved = resolve_script_path(skill_root, script_path)
     env = build_subprocess_env(environment, env_provider or {}, base_environment=base_environment)
@@ -171,18 +178,26 @@ async def _run_process(
         start_new_session=True,
     )
     stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
+    collectors = (_Collector(max_capture_bytes), _Collector(max_capture_bytes))
     try:
         stdout, stderr = await asyncio.wait_for(
-            _communicate_capped(proc, stdin_bytes, max_capture_bytes),
+            _communicate_capped(proc, stdin_bytes, max_capture_bytes, collectors),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         await _stop_process(proc)
+        # Keep partial evidence; the timeout flag marks it incomplete.
+        stdout, stderr = (collector.capture(final=True) for collector in collectors)
+        message = f"{timeout_label} timed out after {timeout_seconds} seconds."
         return ScriptResult(
             exit_code=-1,
-            stdout="",
-            stderr=f"{timeout_label} timed out after {timeout_seconds} seconds.",
+            stdout=stdout.text,
+            stderr=f"{stderr.text.rstrip()}\n{message}" if stderr.text.strip() else message,
             timed_out=True,
+            stdout_bytes_retained=stdout.retained_bytes,
+            stderr_bytes_retained=stderr.retained_bytes,
+            stdout_bytes_omitted=stdout.omitted_bytes,
+            stderr_bytes_omitted=stderr.omitted_bytes,
         )
     except asyncio.CancelledError:
         await _stop_process(proc)
@@ -220,40 +235,62 @@ async def _communicate_capped(
     proc: asyncio.subprocess.Process,
     stdin_bytes: bytes | None,
     cap: int,
+    collectors: tuple[_Collector, _Collector] | None = None,
 ) -> tuple[_StreamCapture, _StreamCapture]:
-    """Exchange standard input and bounded output with a child process and wait for its exit."""
+    """Exchange standard input and bounded output with a child process and wait for its exit.
+
+    Supplied collectors retain what was read if the exchange is cancelled.
+    """
+    out, err = collectors or (_Collector(cap), _Collector(cap))
     stdout_bytes, stderr_bytes, _ = await asyncio.gather(
-        _read_capped(proc.stdout, cap),
-        _read_capped(proc.stderr, cap),
+        _read_capped(proc.stdout, out),
+        _read_capped(proc.stderr, err),
         _feed_stdin(proc, stdin_bytes),
     )
     await proc.wait()
     return stdout_bytes, stderr_bytes
 
 
-async def _read_capped(stream: asyncio.StreamReader | None, cap: int) -> _StreamCapture:
+class _Collector:
+    """Bounded byte accumulator that survives cancellation of its reader."""
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.chunks: list[bytes] = []
+        self.total = 0
+
+    def add(self, chunk: bytes) -> None:
+        """Retain bytes up to the cap while counting everything read."""
+        if self.total < self.cap:
+            self.chunks.append(chunk[: self.cap - self.total])
+        self.total += len(chunk)
+
+    def capture(self, *, final: bool) -> _StreamCapture:
+        """Decode retained bytes; an unfinished stream drops a cut UTF-8 tail."""
+        data = b"".join(self.chunks)
+        # When capture cuts a UTF-8 sequence, leave its incomplete bytes out of the
+        # preview rather than introducing a replacement character at the boundary.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        text = decoder.decode(data, final=final and self.total <= self.cap)
+        retained = len(data) - len(decoder.getstate()[0])
+        return _StreamCapture(text, retained, self.total - retained)
+
+
+async def _read_capped(stream: asyncio.StreamReader | None, collector: _Collector | int) -> _StreamCapture:
     """Drain an output stream while retaining only its first cap bytes.
 
     Continue reading discarded data so a verbose subprocess can finish.
     """
+    if not isinstance(collector, _Collector):
+        collector = _Collector(collector)
     if stream is None:
         return _StreamCapture("", 0, 0)
-    chunks: list[bytes] = []
-    total = 0
     while True:
         chunk = await stream.read(65536)
         if not chunk:
             break
-        if total < cap:
-            chunks.append(chunk[: cap - total])
-        total += len(chunk)
-    data = b"".join(chunks)
-    # When capture cuts a UTF-8 sequence, leave its incomplete bytes out of the
-    # preview rather than introducing a replacement character at the boundary.
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    text = decoder.decode(data, final=total <= cap)
-    retained = len(data) - len(decoder.getstate()[0])
-    return _StreamCapture(text, retained, total - retained)
+        collector.add(chunk)
+    return collector.capture(final=True)
 
 
 async def _feed_stdin(
