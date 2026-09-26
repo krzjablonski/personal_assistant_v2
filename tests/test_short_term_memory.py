@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 from llm.i_llm_client import LLMResponse
 from llm.messages import Image, Message, ToolCall
-from memory.short_term_memory import ShortTermMemory, ShortTermMemoryConfig, _estimate_message_tokens
+from memory.short_term_memory import _SUMMARY_PREFIX, ShortTermMemory, ShortTermMemoryConfig, _estimate_message_tokens
 
 
 class TestShortTermMemory(unittest.IsolatedAsyncioTestCase):
@@ -22,12 +22,12 @@ class TestShortTermMemory(unittest.IsolatedAsyncioTestCase):
         messages = [Message("user", "Old " * 500), *recent]
         before = deepcopy(messages)
         result = await self.memory.process_messages(messages)
-        self.assertEqual(result, [Message("user", "[Summary of prior conversation]\nPrior summary"), *recent])
+        self.assertEqual(result, [Message("user", _SUMMARY_PREFIX + "Prior summary"), *recent])
         self.assertEqual(messages, before)
         self.assertIs(result[1], recent[0])
 
     async def test_summarization_never_separates_tool_replies_from_their_calls(self):
-        self.client.context_window = 800
+        self.client.context_window = 900
         messages = [
             Message("assistant", "Old " * 450),
             Message("assistant", tool_calls=[ToolCall("c1", "lookup", {}), ToolCall("c2", "lookup", {})]),

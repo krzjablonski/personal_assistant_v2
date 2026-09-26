@@ -24,6 +24,8 @@ from tool_framework.approval import build_approval_id
 from tool_framework.i_tool import ToolOutcome, ToolPolicy, ToolResult
 from tool_framework.tool_executor import ToolExecutionCancelled, ToolExecutor, preparation_failure
 
+MAX_CONCURRENT_BATCH_CALLS = 8
+
 
 def retry_delay(result: ToolResult, attempts_used: int, max_delay: float) -> float:
     """Return a capped retry delay using a valid tool hint or exponential backoff."""
@@ -115,10 +117,13 @@ class ActionRunner:
         )
         results: list[ActionResult | None] = [None] * len(calls)
 
+        limit = asyncio.Semaphore(MAX_CONCURRENT_BATCH_CALLS)
+
         async def execute_call_by_index(call_index: int):
             call = calls[call_index]
             try:
-                results[call_index] = await self.execute(call)
+                async with limit:
+                    results[call_index] = await self.execute(call)
             except asyncio.CancelledError as error:
                 tool_result = error.result if isinstance(error, ToolExecutionCancelled) else ToolResult(
                     call.name, call.arguments,

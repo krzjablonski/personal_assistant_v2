@@ -10,6 +10,7 @@ import venv
 from config_service.paths import default_data_dir
 
 PIN = 'browser-use==0.13.10'
+INSTALL_TIMEOUT_SECONDS = 900
 
 
 def main(argv=None):
@@ -26,7 +27,13 @@ def main(argv=None):
         if root.exists() and not (root / 'pyvenv.cfg').is_file():
             parser.error('Refusing to install into an existing directory that is not a virtual environment')
         venv.EnvBuilder(with_pip=True).create(root)
-        subprocess.run([str(python), '-m', 'pip', 'install', '-r', str(Path(__file__).with_name('browser-requirements.txt'))], check=True)
+        try:
+            subprocess.run([str(python), '-m', 'pip', 'install', '--disable-pip-version-check',
+                            '-r', str(Path(__file__).with_name('browser-requirements.txt'))],
+                           check=True, timeout=INSTALL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            print(f'Browser dependency install exceeded {INSTALL_TIMEOUT_SECONDS} seconds; rerun --install.', file=sys.stderr)
+            return 1
     if not python.is_file():
         print('Browser environment missing. Run this command with --install.', file=sys.stderr)
         return 1

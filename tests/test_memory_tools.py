@@ -94,9 +94,12 @@ class TestMemoryTools(unittest.TestCase):
 
         self.assertEqual(save.name, "save_memory")
         self.assertEqual(recall.name, "recall_memory")
-        # Memory tools never require approval; output is capped for context.
-        self.assertFalse(save.policy.requires_approval)
+        # Saving persists across sessions and needs approval; recall is read-only.
+        self.assertTrue(save.policy.requires_approval)
+        self.assertTrue(save.policy.approval_reason)
         self.assertFalse(recall.policy.requires_approval)
+        prepared = save.prepare_action({"content": "User prefers tea"})
+        self.assertEqual(prepared.approval_arguments, {"content": "User prefers tea", "category": "general"})
         self.assertFalse(save.policy.can_parallel)
         self.assertEqual(recall.policy.max_output_chars, 20_000)
 

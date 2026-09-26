@@ -1,3 +1,4 @@
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import List, Optional
@@ -16,6 +17,18 @@ class MemoryEntry:
 
 
 MEMORY_CATEGORIES = ("preference", "fact", "person", "instruction", "general")
+_QUERY_TOKEN_RE = re.compile(r"\w+")
+_MAX_QUERY_TOKENS = 32
+
+
+def _fts_query(query: str) -> str:
+    """Build an FTS5 query matching any keyword; each token is a quoted prefix term.
+
+    Quoting keeps user text from being parsed as FTS5 syntax, and the prefix
+    form lets ``meeting`` match ``meetings``. Returns "" when there are no words.
+    """
+    tokens = list(dict.fromkeys(token.lower() for token in _QUERY_TOKEN_RE.findall(query)))
+    return " OR ".join('"' + token.replace('"', '""') + '"*' for token in tokens[:_MAX_QUERY_TOKENS])
 
 
 class LongTermMemory:
@@ -107,7 +120,9 @@ class LongTermMemory:
         limit: int = 5,
     ) -> List[MemoryEntry]:
         """Find relevance-ranked memories without modifying stored records."""
-        safe_query = '"' + query.replace('"', '""') + '"'
+        safe_query = _fts_query(query)
+        if not safe_query:
+            return []
 
         if category:
             rows = self._conn.execute(

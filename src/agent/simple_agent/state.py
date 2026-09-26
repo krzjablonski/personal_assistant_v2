@@ -47,13 +47,28 @@ class IterationBudget:
         return max(0, self.limit - self.used)
 
 
+MAX_RECORDED_CHANGES = 20
+MAX_CHANGE_CHARS = 500
+
+
+def _bounded_change(text: str) -> str:
+    return text if len(text) <= MAX_CHANGE_CHARS else text[:MAX_CHANGE_CHARS - 3] + "..."
+
+
 @dataclass
 class SessionState:
-    """The retained conversation and concrete effect context for one session."""
+    """The retained conversation and concrete effect context for one session.
+
+    Effect lists are injected into every system prompt, so each keeps only the
+    most recent MAX_RECORDED_CHANGES entries of at most MAX_CHANGE_CHARS each;
+    the *_omitted counters record how many older entries were dropped.
+    """
 
     messages: list[Message] = field(default_factory=list)
     confirmed_changes: list[str] = field(default_factory=list)
     uncertain_changes: list[str] = field(default_factory=list)
+    confirmed_omitted: int = 0
+    uncertain_omitted: int = 0
 
     def record_changes(self, metadata: dict) -> None:
         """Keep uncertainty authoritative when conflicting change reports arrive."""
@@ -64,7 +79,7 @@ class SessionState:
             if not isinstance(changes, list):
                 continue
             for change in changes:
-                text = str(change)
+                text = _bounded_change(str(change))
                 if not text:
                     continue
                 if key == "uncertain_changes":
@@ -74,6 +89,12 @@ class SessionState:
                         self.uncertain_changes.append(text)
                 elif text not in self.uncertain_changes and text not in self.confirmed_changes:
                     self.confirmed_changes.append(text)
+        if len(self.confirmed_changes) > MAX_RECORDED_CHANGES:
+            self.confirmed_omitted += len(self.confirmed_changes) - MAX_RECORDED_CHANGES
+            del self.confirmed_changes[:-MAX_RECORDED_CHANGES]
+        if len(self.uncertain_changes) > MAX_RECORDED_CHANGES:
+            self.uncertain_omitted += len(self.uncertain_changes) - MAX_RECORDED_CHANGES
+            del self.uncertain_changes[:-MAX_RECORDED_CHANGES]
 
 class TurnBudgetExceeded(RuntimeError):
     """The shared invocation budget has no remaining model or retry call."""

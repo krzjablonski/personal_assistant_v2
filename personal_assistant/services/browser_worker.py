@@ -24,10 +24,27 @@ PAGE_STATE = """() => ({url: location.href, title: document.title,
  inputs: Array.from(document.querySelectorAll('input,textarea,select')).slice(0,500).map(e =>
  [e.type,e.value,e.checked,e.disabled]), scroll: [scrollX,scrollY]})"""
 
-TARGET_STATE = """function() { return {html:this.outerHTML, tag:this.tagName.toLowerCase(),
- root:this.getRootNode()===document, value:this.value, checked:this.checked, disabled:!!this.disabled,
- type:this.getAttribute('type')||'', label:this.getAttribute('aria-label')||this.getAttribute('placeholder')||
- (this.innerText||this.textContent||this.getAttribute('name')||'').slice(0,160)}; }"""
+TARGET_STATE = """function() {
+ const norm=(s)=>(s||'').replace(/\\s+/g,' ').trim();
+ const tag=this.tagName.toLowerCase(), type=this.getAttribute('type')||'';
+ const buttonInput=tag==='input' && ['button','submit','reset'].includes(type.toLowerCase());
+ const visible=norm(buttonInput ? this.value : this.innerText).slice(0,160);
+ const aria=norm(this.getAttribute('aria-label')).slice(0,160);
+ const placeholder=norm(this.getAttribute('placeholder')).slice(0,160);
+ const name=norm(this.getAttribute('name')||this.textContent).slice(0,160);
+ const a=visible.toLowerCase(), b=aria.toLowerCase();
+ const form=tag==='form' ? this : (this.form || null);
+ // Prototype getter: named form controls (e.g. name="action") cannot shadow it.
+ const formAction=form ? Object.getOwnPropertyDescriptor(HTMLFormElement.prototype,'action').get.call(form) : '';
+ return {html:this.outerHTML, tag, root:this.getRootNode()===document, value:this.value, checked:this.checked,
+ disabled:!!this.disabled, type, label:visible||aria||placeholder||name, text:visible, aria_label:aria,
+ placeholder, label_mismatch:!!(visible && aria && !a.includes(b) && !b.includes(a)),
+ href:(typeof this.href==='string' ? this.href : '').slice(0,2000),
+ form_action:String(this.hasAttribute('formaction') && this.formAction ? this.formAction : formAction||'').slice(0,2000)}; }"""
+
+# Snapshot element fields shown to the model and in approval prompts.
+TARGET_DISPLAY_FIELDS = (('text', 160), ('aria_label', 160), ('placeholder', 160),
+                         ('label_mismatch', None), ('href', 2000), ('form_action', 2000))
 
 TARGET_ACTION = """function(expectedPage, expectedTarget, action, value) {
  const currentPage = (""" + PAGE_STATE + """)();
@@ -183,8 +200,12 @@ class Worker:
             if attrs.get('type', '').lower() in ('password', 'file'):
                 continue
             self.targets[ref] = (node.backend_node_id, target)
-            elements.append({'ref': ref, 'tag': target['tag'], 'label': target['label'][:160],
-                             'type': target['type'][:40]})
+            element = {'ref': ref, 'tag': target['tag'], 'label': target['label'][:160],
+                       'type': target['type'][:40]}
+            for field, limit in TARGET_DISPLAY_FIELDS:
+                if target.get(field):
+                    element[field] = target[field] if limit is None else target[field][:limit]
+            elements.append(element)
         self.fingerprint = fingerprint
         return {'observation': {'identity': self.identity, 'generation': self.generation,
                                 'url': value['url'][:4000], 'title': value['title'][:300],
@@ -246,6 +267,31 @@ class Worker:
         await asyncio.gather(*self.background, return_exceptions=True)
 
 
+REQUEST_LIMIT = 32768
+OVERSIZED = object()
+
+
+async def read_request(reader):
+    """Return the next request line, b'' at EOF, or OVERSIZED after discarding a too-long line."""
+    try:
+        return await reader.readuntil(b'\n')
+    except asyncio.IncompleteReadError as error:
+        return error.partial
+    except asyncio.LimitOverrunError as error:
+        consumed = error.consumed
+    # Drop the oversized line, including bytes that have not arrived yet, so
+    # the next request starts on a line boundary.
+    while True:
+        try:
+            await reader.readexactly(consumed)
+            await reader.readuntil(b'\n')
+            return OVERSIZED
+        except asyncio.IncompleteReadError:
+            return OVERSIZED
+        except asyncio.LimitOverrunError as error:
+            consumed = error.consumed
+
+
 async def main():
     protocol = sys.stdout
     worker = Worker()
@@ -253,12 +299,15 @@ async def main():
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, task.cancel)
-    reader = asyncio.StreamReader(limit=32768)
+    reader = asyncio.StreamReader(limit=REQUEST_LIMIT)
     transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
     try:
         with redirect_stdout(sys.stderr):
-            while line := await reader.readline():
+            while line := await read_request(reader):
                 try:
+                    if line is OVERSIZED:
+                        worker.started_action = False
+                        raise ValueError('Browser request exceeded the size limit and was ignored')
                     response = await worker.action(json.loads(line))
                 except ValueError as error:
                     response = {'error': str(error)[:300], 'not_executed': not worker.started_action}
