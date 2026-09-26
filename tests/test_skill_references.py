@@ -27,9 +27,10 @@ class SkillReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillReferenceError, r"@missing.*\/skills"):
             parse_skill_references("@email @missing", self.names)
 
-    def test_bare_marker_requires_a_selection(self):
-        with self.assertRaises(SkillReferenceError):
-            parse_skill_references("Use @", self.names)
+    def test_bare_marker_is_literal_text(self):
+        self.assertEqual(parse_skill_references("Use @", self.names), ())
+        self.assertEqual(parse_skill_references("meet @ 5pm", self.names), ())
+        self.assertEqual(parse_skill_references("meet @ 5pm with @email", self.names), ("email",))
 
     def test_fence_must_close_with_matching_marker(self):
         self.assertEqual(parse_skill_references("````\n```\n@missing\n````\n@email", self.names), ("email",))

@@ -13,11 +13,13 @@ from email_utils import EmailRecipientPolicyError, encode_gmail_raw, parse_draft
 from google_credentials import GoogleCredentialsError, load_google_credentials
 
 
-def _single_recipient(value: str) -> str:
+def _reply_mailboxes(value: str) -> frozenset[str]:
+    """Return the casefolded mailboxes of a recipient header, rejecting malformed entries."""
     recipients = getaddresses([value])
-    if "\r" in value or "\n" in value or len(recipients) != 1 or not re.fullmatch(r"[^\s@,<>]+@[^\s@,<>]+", recipients[0][1]):
-        raise ValueError("Reply drafts require exactly one valid recipient")
-    return recipients[0][1].casefold()
+    if ("\r" in value or "\n" in value or not recipients
+            or any(not re.fullmatch(r"[^\s@,<>]+@[^\s@,<>]+", address) for _name, address in recipients)):
+        raise ValueError("Reply drafts require valid recipient mailboxes")
+    return frozenset(address.casefold() for _name, address in recipients)
 
 
 def _reply_subject(value: str) -> str:
@@ -72,9 +74,11 @@ def main(argv: list[str] | None = None) -> int:
             thread_id = original.get("threadId")
             if original.get("id") != args.message_uid or not original_id or not thread_id:
                 raise ValueError("Original Gmail message lacks a confirmed identity and reply thread")
-            recipient = _single_recipient(headers.get("reply-to") or headers.get("from", ""))
-            if _single_recipient(to) != recipient:
-                raise ValueError("Reply draft recipient does not match the original sender or Reply-To")
+            # Reply to every Reply-To mailbox (or the sender); each one was
+            # already checked against ALLOWED_EMAIL_RECIPIENTS via --to.
+            recipients = _reply_mailboxes(headers.get("reply-to") or headers.get("from", ""))
+            if _reply_mailboxes(to) != recipients:
+                raise ValueError("Reply draft recipients do not match the original sender or Reply-To")
             if _reply_subject(args.subject) != _reply_subject(headers.get("subject", "")):
                 raise ValueError("Reply draft subject does not match the original message")
             # Gmail's thread contract requires threadId and RFC reply headers.

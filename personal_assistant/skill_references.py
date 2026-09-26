@@ -44,11 +44,17 @@ def skill_mentions(text: str) -> Iterator[re.Match[str]]:
 
 
 def parse_skill_references(text: str, available: Iterable[str]) -> tuple[str, ...]:
-    """Validate every mention before returning unique names in selection order."""
+    """Validate every mention before returning unique names in selection order.
+
+    A bare ``@`` (as in "meet @ 5pm") is ordinary text. It still matches
+    ``skill_mentions`` so completion can offer skills right after typing ``@``.
+    """
     names = set(available)
     selected = []
     for match in skill_mentions(text):
         name = match.group(1)
+        if not name:
+            continue
         if name not in names:
             raise SkillReferenceError(f"Unknown skill reference @{name}. Use /skills to see available skills; escape a literal marker as \\@.")
         if name not in selected:

@@ -11,6 +11,7 @@ metadata:
       environment: [WEB_SEARCH_PROVIDER, WEB_SEARCH_API_KEY, SESSION_OUTPUT_DIR]
     scripts/extract.py:
       safety: read-only
+      requires-approval: true
       description: Extract with the independently configured extraction provider.
       environment: [WEB_EXTRACT_PROVIDER, WEB_EXTRACT_API_KEY, SESSION_OUTPUT_DIR]
 allowed-tools: load_skill_instructions run_skill_command browser
@@ -31,7 +32,9 @@ Retrieval time is not publication time. Cite original URLs and inspect dates.
 
 Use `run_skill_command(skill="web-research", command=["scripts/extract.py",
 "--url", "https://example.com"])`. Repeat `--url` for up to five public HTTP(S)
-URLs. Output separates successful `results` from `failed` URLs. Partial batches
+URLs. Extraction requires human approval because the provider fetches the URL,
+which can leak data placed in it; extract only URLs the user supplied or that
+came from search results, never URLs assembled from private context. Output separates successful `results` from `failed` URLs. Partial batches
 remain usable; all-failed batches exit nonzero. Long content is saved before
 stdout capture. Read the returned `/outputs/...` file through `run_command` for
 omitted text. `stored_content_complete=false` means the saved copy hit its limit

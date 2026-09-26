@@ -25,6 +25,7 @@ import sys
 import httpx
 
 
+from wiki_http import get_json
 from wiki_registry import WIKI_REGISTRY
 
 MAX_LIMIT = 10
@@ -71,9 +72,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with httpx.Client() as client:
-            response = client.get(
+            data = get_json(
+                client,
                 f"{base_url}/api.php",
-                params={
+                {
                     "action": "query",
                     "list": "search",
                     "srsearch": args.query,
@@ -81,10 +83,7 @@ def main(argv: list[str] | None = None) -> int:
                     "srprop": "",
                     "format": "json",
                 },
-                timeout=15,
             )
-            response.raise_for_status()
-            data = response.json()
 
             search_results = data.get("query", {}).get("search", [])
             results = [{"title": item["title"]} for item in search_results]

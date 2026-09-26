@@ -20,9 +20,9 @@ def parse_event_times(
     """Build Calendar start and end fields from a complete timed or all-day interval.
 
     Return (start, end, error) with an error for mixed modes, missing partners,
-    invalid dates, or reversed intervals. With no times and required=False,
-    return (None, None, None) to preserve existing event times.
-    Comparing mixed offset-aware and naive datetimes can raise TypeError.
+    invalid dates, mixed offset-aware and naive datetimes, or reversed
+    intervals. With no times and required=False, return (None, None, None) to
+    preserve existing event times.
     """
     has_datetime = start_datetime is not None or end_datetime is not None
     has_date = start_date is not None or end_date is not None
@@ -53,6 +53,11 @@ def parse_event_times(
             return None, None, (
                 f"Could not parse datetime - {exc}. Use ISO 8601 format, "
                 "e.g. '2026-03-01T14:00:00Z'."
+            )
+        if (start_dt.tzinfo is None) != (end_dt.tzinfo is None):
+            return None, None, (
+                "start_datetime and end_datetime must both include a UTC offset "
+                "or both omit it (then --timezone applies)."
             )
         if end_dt <= start_dt:
             return None, None, "end_datetime must be after start_datetime."

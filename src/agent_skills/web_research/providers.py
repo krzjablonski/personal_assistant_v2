@@ -22,20 +22,64 @@ class WebError(ValueError):
         self.category = category
 
 
+# Public wildcard DNS services that resolve embedded addresses such as 127.0.0.1.nip.io.
+_REBINDING_SUFFIXES = ("nip.io", "sslip.io", "xip.io", "localtest.me", "lvh.me")
+_LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa")
+
+
+def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """Parse inet_aton-style IPv4 forms (``127.1``, ``0x7f.0.0.1``, octal, integer) resolvers accept."""
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    values = []
+    for part in parts:
+        try:
+            if part[:2] in {"0x", "0X"}:
+                values.append(int(part[2:] or "0", 16))
+            elif len(part) > 1 and part.startswith("0"):
+                values.append(int(part, 8))
+            elif part.isdigit():
+                values.append(int(part))
+            else:
+                return None
+        except ValueError:
+            return None
+    *head, last = values
+    if any(value > 255 for value in head) or last >= 256 ** (5 - len(values)):
+        return None
+    number = 0
+    for value in head:
+        number = number * 256 + value
+    return ipaddress.IPv4Address(number * 256 ** (4 - len(head)) + last)
+
+
+def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = address.ipv4_mapped or address.sixtofour or (address.teredo[1] if address.teredo else None)
+        if embedded is not None and not embedded.is_global:
+            return False
+    return address.is_global and not address.is_multicast
+
+
 def validate_url(url: str) -> str:
     try:
         parsed = urlsplit(url)
-        host = parsed.hostname or ""
+        host = (parsed.hostname or "").rstrip(".")
         parsed.port
         if len(url) > 4000 or parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
             raise ValueError
-        if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan")) or "." not in host:
+        if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
+            raise ValueError
+        if host in _REBINDING_SUFFIXES or host.endswith(tuple("." + suffix for suffix in _REBINDING_SUFFIXES)):
             raise ValueError
         try:
-            address = ipaddress.ip_address(host)
+            address = ipaddress.ip_address(host.split("%", 1)[0])
         except ValueError:
-            address = None
-        if address is not None and not address.is_global:
+            address = _legacy_ipv4(host)
+        if address is None and (":" in host or "." not in host):
+            raise ValueError
+        if address is not None and not _is_public_address(address):
             raise ValueError
     except ValueError:
         raise WebError("Use a public HTTP(S) URL without embedded credentials.", "invalid_url") from None
