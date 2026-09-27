@@ -8,9 +8,14 @@ import unittest
 from unittest.mock import patch
 
 
+# .docs/ is not part of the public repository; skip cleanly when absent.
+TUTORIAL_BUILD = Path(__file__).resolve().parents[1] / ".docs" / "tutorial" / "build.py"
+
+
+@unittest.skipUnless(TUTORIAL_BUILD.is_file(), ".docs/tutorial is not included in this checkout")
 class TestTutorialBuild(unittest.TestCase):
     def test_check_is_read_only_for_each_generated_artifact(self):
-        source = Path(__file__).resolve().parents[1] / ".docs" / "tutorial" / "build.py"
+        source = TUTORIAL_BUILD
         spec = importlib.util.spec_from_file_location("tutorial_build", source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

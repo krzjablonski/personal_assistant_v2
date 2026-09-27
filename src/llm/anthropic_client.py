@@ -22,13 +22,28 @@ if TYPE_CHECKING:
 
 
 _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
-    "claude-sonnet-4-20250514": 200_000,
-    "claude-opus-4-20250514": 200_000,
-    "claude-3-5-sonnet-20241022": 200_000,
-    "claude-3-opus-20240229": 200_000,
-    "claude-3-haiku-20240307": 200_000,
+    "claude-2.0": 100_000,
 }
-_ANTHROPIC_FALLBACK_CONTEXT_WINDOW = 100_000
+# Model families matched by prefix; the longest matching prefix wins.
+_ANTHROPIC_CONTEXT_WINDOW_PREFIXES: dict[str, int] = {
+    "claude-sonnet-4": 200_000,
+    "claude-opus-4": 200_000,
+    "claude-haiku-4": 200_000,
+    "claude-3": 200_000,
+    "claude-2.1": 200_000,
+}
+_ANTHROPIC_FALLBACK_CONTEXT_WINDOW = 200_000
+
+
+def _anthropic_context_window(model: str) -> int:
+    """Estimate a Claude model's context window from exact names, then family prefixes."""
+    name = model.strip().lower()
+    if name in _ANTHROPIC_CONTEXT_WINDOWS:
+        return _ANTHROPIC_CONTEXT_WINDOWS[name]
+    matches = [prefix for prefix in _ANTHROPIC_CONTEXT_WINDOW_PREFIXES if name.startswith(prefix)]
+    if matches:
+        return _ANTHROPIC_CONTEXT_WINDOW_PREFIXES[max(matches, key=len)]
+    return _ANTHROPIC_FALLBACK_CONTEXT_WINDOW
 
 
 class AnthropicClient(ILLMClient):
@@ -67,9 +82,7 @@ class AnthropicClient(ILLMClient):
         """Return the explicit context capacity or the locally configured model estimate and fallback."""
         if self._context_window_override is not None:
             return self._context_window_override
-        return _ANTHROPIC_CONTEXT_WINDOWS.get(
-            self.model, _ANTHROPIC_FALLBACK_CONTEXT_WINDOW
-        )
+        return _anthropic_context_window(self.model)
 
     async def chat(
         self,

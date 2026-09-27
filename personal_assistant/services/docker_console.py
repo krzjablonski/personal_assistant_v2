@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -40,23 +41,56 @@ def _host_environment() -> dict[str, str]:
     return {key: os.environ[key] for key in ("PATH", "HOME", "LANG") if key in os.environ}
 
 
+def _identity(path: Path) -> tuple[int, int] | None:
+    """Return the filesystem identity of an existing path, or None."""
+    try:
+        stat = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+def _contains(parent: Path, child: Path) -> bool:
+    """Report containment lexically or by inode, so case-insensitive aliases still match."""
+    if child.is_relative_to(parent):
+        return True
+    # realpath keeps user casing on case-insensitive volumes (APFS, NTFS):
+    # compare each existing ancestor's (device, inode) with the parent's.
+    target = _identity(parent)
+    return target is not None and any(_identity(path) == target for path in (child, *child.parents))
+
+
 def _overlaps(left: Path, right: Path) -> bool:
-    return left.is_relative_to(right) or right.is_relative_to(left)
+    return _contains(right, left) or _contains(left, right)
 
 
 def protected_host_paths() -> tuple[Path, ...]:
     home = Path.home()
     application = Path(__file__).resolve().parents[1]
+    checkout = application.parent
+    extra = []
+    try:
+        extra.append(Path(site.getusersitepackages()))
+    except Exception:
+        pass
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and Path(runtime).is_absolute():
+        extra.append(Path(runtime))
+    if hasattr(os, "getuid"):
+        extra.append(Path("/run/user") / str(os.getuid()))
     return tuple(path.resolve() for path in (
         application, Path(agent_skills.__file__).parent.parent,
         Path(config_service.__file__).parent, Path(sys.prefix), default_data_dir(),
-        application.parent / ".env", application.parent / "client_secret.json",
+        checkout / ".env", checkout / "client_secret.json", checkout / ".git", checkout / "tools",
         home / ".ssh", home / ".aws", home / ".docker", home / ".config",
         home / ".codex", home / ".agents", home / ".gnupg", home / ".kube", home / ".mozilla",
-        home / "Library/Keychains", home / "Library/Safari",
+        home / ".local/share/keyrings", home / ".password-store",
+        home / "Library/Keychains", home / "Library/Safari", home / "Library/Cookies",
+        home / "Library/Mail", home / "Library/Messages",
         home / "Library/Containers", home / "Library/Group Containers",
         home / "Library/Application Support/Google", home / "Library/Application Support/Firefox",
         home / "Library/Application Support/Microsoft Edge", home / "Library/Application Support/BraveSoftware",
+        *extra,
     ))
 
 
@@ -130,7 +164,7 @@ class DockerConsole:
             raise ValueError(f"Console mount {target} directory is unavailable: {original}.") from error
         if target == "/workspace" and self._managed_workspace is not None and path != self._managed_workspace:
             raise ValueError("The managed workspace must not be redirected through a symlink.")
-        if (require_exists and not path.is_dir()) or Path.home().resolve().is_relative_to(path):
+        if (require_exists and not path.is_dir()) or _contains(path, Path.home().resolve()):
             raise ValueError("Console mounts must be narrow directories, never host root or home.")
         data_roots = {default_data_dir().resolve(), self.data_directory}
         protected = (*protected_host_paths(), self.data_directory, *(p.resolve() for p in self.protected_paths))
@@ -257,7 +291,8 @@ class DockerConsole:
                       cwd: str, timeout: float) -> ConsoleResult:
         if tuple(self.mounts()) != environment.mounts:
             raise ValueError("The approved mount scope changed; prepare again and obtain fresh approval.")
-        if self.connection() != (environment.docker, environment.endpoint):
+        # Context inspection runs docker; keep the event loop (UI, cancel) responsive.
+        if await asyncio.to_thread(self.connection) != (environment.docker, environment.endpoint):
             raise ValueError("The approved Docker endpoint changed; prepare again and obtain fresh approval.")
         self._exclude_sockets(environment.mounts, environment.endpoint)
         name = "pa-console-" + uuid.uuid4().hex

@@ -17,6 +17,30 @@ from email_utils import (
 )
 from google_credentials import GoogleCredentialsError, load_google_credentials
 
+CREATE_ATTEMPTS = 5
+
+
+def _ensure_private_directory(directory: str) -> None:
+    """Create the attachment directory owner-only; leave an existing directory's mode alone."""
+    try:
+        os.makedirs(directory, mode=0o700)
+    except FileExistsError:
+        if not os.path.isdir(directory):
+            raise
+        return
+    os.chmod(directory, 0o700)
+
+
+def _create_exclusive(directory: str, filename: str) -> tuple[str, int]:
+    """Open a new owner-only file, retrying a fresh unique name if another writer wins the race."""
+    for attempt in range(1, CREATE_ATTEMPTS + 1):
+        filepath = unique_filepath(directory, filename)
+        try:
+            return filepath, os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if attempt == CREATE_ATTEMPTS:
+                raise
+
 
 def main(argv: list[str] | None = None) -> int:
     """Download named attachments from a Gmail message into the configured attachment directory.
@@ -45,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        os.makedirs(attachments_dir, exist_ok=True)
+        _ensure_private_directory(attachments_dir)
     except OSError as exc:
         print(f"Error: Could not create attachments directory - {exc}", file=sys.stderr)
         return 1
@@ -92,12 +116,11 @@ def main(argv: list[str] | None = None) -> int:
         if not filename:
             continue
         filename = sanitize_filename(decode_header_value(filename)) or "attachment"
-        filepath = unique_filepath(attachments_dir, filename)
         payload = part.get_payload(decode=True)
         if payload is None:
             continue
         try:
-            descriptor = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            filepath, descriptor = _create_exclusive(attachments_dir, filename)
             with os.fdopen(descriptor, "wb") as file:
                 file.write(payload)
             saved = {"path": filepath, "size_bytes": len(payload)}

@@ -73,7 +73,8 @@ class PreparedAction:
     """One validated execution snapshot; private values stay inside the callable.
 
     Arguments are the resolved model call used for result reporting.
-    Approval arguments contain only safe display values and opaque bindings.
+    Approval arguments are the exact reviewed scope; private configuration
+    appears only as opaque bindings. Logs and traces redact separately.
     Execution and approval receive separate copies so neither can alter the other.
     """
 

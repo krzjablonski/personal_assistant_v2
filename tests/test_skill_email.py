@@ -197,7 +197,7 @@ class TestGmailApiHelpers(unittest.TestCase):
         self.assertEqual(service.users().messages().list.call_args.kwargs["q"], "is:unread newer_than:7d")
         self.assertEqual(json.loads(output.getvalue()), {
             "folder": "INBOX", "query": "is:unread newer_than:7d", "count": 0,
-            "requested_count": 5, "selection_limit_reached": False, "emails": [],
+            "requested_count": 5, "selection_limit_reached": False, "output_truncated": False, "emails": [],
         })
 
     def test_summary_consumes_parsed_mime_without_serializing_it(self) -> None:

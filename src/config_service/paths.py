@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from time import monotonic
@@ -24,11 +25,49 @@ def default_data_dir() -> Path:
     return Path.home() / ".local" / "share" / "personal-assistant"
 
 
+_PERMISSION_WARNINGS: set[Path] = set()
+
+
 def private_directory(path: Path) -> Path:
-    """Create an application data directory with access limited to its owner."""
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    """Create an application data directory with access limited to its owner.
+
+    Only directories created here are restricted to 0700. An existing directory
+    (for example a user-named --data-dir) keeps its permissions; if group or
+    other users can access it, a one-time warning is printed instead.
+    """
+    try:
+        path.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077 and path.absolute() not in _PERMISSION_WARNINGS:
+            _PERMISSION_WARNINGS.add(path.absolute())
+            print(
+                f"Warning: private data directory {path} is accessible by other users "
+                f"(mode {mode:o}); run 'chmod 700 {path}' to restrict it.",
+                file=sys.stderr,
+            )
+        return path
     path.chmod(0o700)
     return path
+
+
+def _copy_regular_file_nofollow(source: Path, destination: Path) -> None:
+    """Copy a regular file without following a final-component symbolic link."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        if source.is_symlink():
+            raise ValueError("Migration does not follow a symbolic link for the inbox-triage report") from error
+        raise
+    with os.fdopen(descriptor, "rb") as reader:
+        if not stat.S_ISREG(os.fstat(reader.fileno()).st_mode):
+            raise ValueError("Migration report must be a regular file")
+        with open(destination, "xb") as writer:
+            shutil.copyfileobj(reader, writer)
+    shutil.copystat(source, destination, follow_symlinks=False)
 
 
 def migrate_legacy_data(source: Path, target: Path, *, report_path: Path | None = None, timeout_seconds: float = 30) -> None:
@@ -73,8 +112,10 @@ def migrate_legacy_data(source: Path, target: Path, *, report_path: Path | None 
                 shutil.copy2(original, destination)
             copied.append(name)
         if report_path is not None and report_path.is_file():
+            if report_path.is_symlink():
+                raise ValueError("Migration does not follow a symbolic link for the inbox-triage report")
             reports = private_directory(staging / "reports")
-            shutil.copy2(report_path, reports / "inbox-triage.md")
+            _copy_regular_file_nofollow(report_path, reports / "inbox-triage.md")
             copied.append("reports/inbox-triage.md")
         # Rebase only artifact locations. Tool inputs and old log transcripts
         # remain verbatim historical evidence.

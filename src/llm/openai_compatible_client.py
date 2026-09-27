@@ -15,15 +15,44 @@ if TYPE_CHECKING:
 
 
 _OPENAI_CONTEXT_WINDOWS: dict[str, int] = {
-    "gpt-4o": 128_000,
-    "gpt-4o-mini": 128_000,
-    "gpt-4-turbo": 128_000,
-    "gpt-4-turbo-preview": 128_000,
     "gpt-4": 8_192,
+    "gpt-4-32k": 32_768,
     "gpt-3.5-turbo": 16_385,
     "gpt-3.5-turbo-16k": 16_385,
+    "o1-mini": 128_000,
+    "o1-preview": 128_000,
 }
-_OPENAI_FALLBACK_CONTEXT_WINDOW = 8_192
+# Model families matched by prefix; the longest matching prefix wins.
+_OPENAI_CONTEXT_WINDOW_PREFIXES: dict[str, int] = {
+    "gpt-5": 400_000,
+    "gpt-4.1": 1_047_576,
+    "gpt-4o": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-3.5-turbo": 16_385,
+    "o1": 200_000,
+    "o3": 200_000,
+    "o4": 200_000,
+    # OpenRouter also serves other vendors through this client.
+    "claude-": 200_000,
+    "gemini-": 1_048_576,
+}
+_OPENAI_FALLBACK_CONTEXT_WINDOW = 128_000
+
+
+def _openai_context_window(model: str) -> int:
+    """Estimate a model's context window from exact names, then family prefixes.
+
+    OpenRouter-style ``vendor/model`` names and ``:variant`` suffixes are
+    reduced to the bare model name before lookup; unknown modern models get a
+    generous default rather than a legacy 8k window.
+    """
+    name = model.strip().lower().rsplit("/", 1)[-1].split(":", 1)[0]
+    if name in _OPENAI_CONTEXT_WINDOWS:
+        return _OPENAI_CONTEXT_WINDOWS[name]
+    matches = [prefix for prefix in _OPENAI_CONTEXT_WINDOW_PREFIXES if name.startswith(prefix)]
+    if matches:
+        return _OPENAI_CONTEXT_WINDOW_PREFIXES[max(matches, key=len)]
+    return _OPENAI_FALLBACK_CONTEXT_WINDOW
 
 
 class OpenAICompatibleClient(ILLMClient):
@@ -66,7 +95,7 @@ class OpenAICompatibleClient(ILLMClient):
         """Return the explicit context capacity or the locally configured model estimate and fallback."""
         if self._context_window_override is not None:
             return self._context_window_override
-        return _OPENAI_CONTEXT_WINDOWS.get(self.model, _OPENAI_FALLBACK_CONTEXT_WINDOW)
+        return _openai_context_window(self.model)
 
     async def chat(
         self,

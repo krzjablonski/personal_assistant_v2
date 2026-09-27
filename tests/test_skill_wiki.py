@@ -11,7 +11,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
+import httpx
 
 from agent_skills.catalog import SkillCatalog
 
@@ -72,16 +74,21 @@ class TestWikiCliValidation(unittest.TestCase):
 class TestWikiPureLogic(unittest.TestCase):
     def test_search_returns_titles_with_one_request(self) -> None:
         module = _load_module(SEARCH)
-        client = MagicMock()
-        client.get.return_value.json.return_value = {"query": {"search": [
-            {"title": "Cthulhu"}, {"title": "R'lyeh"}, {"title": "Dagon"},
-        ]}}
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, json={"query": {"search": [
+                {"title": "Cthulhu"}, {"title": "R'lyeh"}, {"title": "Dagon"},
+            ]}})
+
+        client = httpx.Client(transport=httpx.MockTransport(respond))
         output = io.StringIO()
         with patch.object(module.httpx, "Client") as constructor, redirect_stdout(output):
             constructor.return_value.__enter__.return_value = client
             status = module.main(["--wiki", "lovecraft", "--query", "gods"])
         self.assertEqual(status, 0)
-        client.get.assert_called_once()
+        self.assertEqual(len(requests), 1)
         self.assertEqual(json.loads(output.getvalue()), {"wiki": "lovecraft", "query": "gods", "results": [
             {"title": "Cthulhu"}, {"title": "R'lyeh"}, {"title": "Dagon"},
         ]})

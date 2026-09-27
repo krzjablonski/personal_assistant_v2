@@ -32,6 +32,8 @@ from tool_framework.tool_collection import ToolCollection
 from tool_framework.tool_executor import ToolExecutor
 
 
+CONTINUATION_PROMPT = ("[Runtime note: your previous answer hit the output limit.] Continue exactly where "
+                       "your previous answer stopped; do not repeat or restart it.")
 REPORT_TIMEOUT_SECONDS = 20
 REPORT_MAX_TOKENS = 1024
 REPORT_SYSTEM = """Explain an interrupted assistant run to its user in concise plain language.
@@ -220,7 +222,10 @@ class SimpleAgent:
                     self.add_message(response.message)
                     self._answer_fragments.append(response.message.text)
                     if response.stop_reason == "max_tokens":
+                        # Providers reject (or treat as prefill) a request ending on an
+                        # assistant turn; ask explicitly for the remainder instead.
                         self._continuing = True
+                        self.add_text_message("user", CONTINUATION_PROMPT)
                         continue
                     if not response.message.text.strip():
                         self._stop(AgentStatus.FAILED, TerminalReason.PROVIDER_FORMAT_ERROR,
@@ -237,9 +242,10 @@ class SimpleAgent:
             self._stop(AgentStatus.BUDGET_EXHAUSTED, TerminalReason.CONTEXT_BUDGET_EXHAUSTED,
                        str(error) + " Reduce the request or use a larger context window.")
         except asyncio.CancelledError:
-            await self.close_resources()
+            # Record cancellation first: a second cancel may interrupt the cleanup.
             self._stop(AgentStatus.CANCELLED, TerminalReason.CANCELLED,
                        "The invocation was cancelled. Review retained results before continuing.")
+            await self.close_resources()
             raise
         except Exception as error:
             self._error_type = type(error).__name__
@@ -319,6 +325,15 @@ class SimpleAgent:
             actions = await self.actions.run(calls)
         except ActionBatchCancelled as error:
             actions, cancelled = error.results, error
+        except BaseException:
+            # Every provider call id needs a reply, or later requests are rejected.
+            for call in calls:
+                self.add_message(Message("tool", "The tool call failed with an internal error; its effect is unknown. "
+                                         "Check its state before retrying.", tool_call_id=call.id,
+                                         tool_name=call.name, is_error=True))
+            self._session.record_changes({"uncertain_changes": [
+                f"Tool call '{call.name}' ended with an internal error; its effect is unknown." for call in calls]})
+            raise
         for action in actions:
             self.add_message(action.to_message())
             self._session.record_changes(action.result.metadata)
@@ -339,10 +354,15 @@ class SimpleAgent:
         if self.skill_runtime is not None:
             parts.append(self.skill_runtime.build_loaded_skill_prompt())
         if self._session.confirmed_changes or self._session.uncertain_changes:
-            parts.append("Protected effect context from this session. Do not repeat completed work or automatically replay uncertain mutations.\n" + json.dumps({
+            effects = {
                 "confirmed_changes": self._session.confirmed_changes,
                 "uncertain_changes": self._session.uncertain_changes,
-            }, ensure_ascii=False))
+            }
+            if self._session.confirmed_omitted or self._session.uncertain_omitted:
+                effects["older_entries_omitted"] = {"confirmed": self._session.confirmed_omitted,
+                                                    "uncertain": self._session.uncertain_omitted}
+            parts.append("Protected effect context from this session. Do not repeat completed work or automatically replay uncertain mutations.\n"
+                         + json.dumps(effects, ensure_ascii=False))
         if self._continuing:
             parts.append("Continue the previous incomplete answer without restarting or repeating it.")
         return "\n\n".join(part for part in parts if part)

@@ -24,25 +24,30 @@ import sys
 import httpx
 
 
+from wiki_http import ResponseTooLarge, get_json
 from wiki_registry import WIKI_REGISTRY
+
+_NON_TEXT_LINK = re.compile(r"\[\[\s*(?:Category|File|Image)\s*:", re.IGNORECASE)
 
 
 def _try_extracts(client: httpx.Client, base_url: str, title: str) -> str | None:
-    """Try to retrieve plain-text article content through TextExtracts, returning None when unavailable."""
+    """Try to retrieve plain-text article content through TextExtracts, returning None when unavailable.
+
+    Redirect pages are followed to their target. Oversized responses propagate.
+    """
     try:
-        response = client.get(
+        data = get_json(
+            client,
             f"{base_url}/api.php",
-            params={
+            {
                 "action": "query",
                 "titles": title,
                 "prop": "extracts",
                 "explaintext": "true",
+                "redirects": 1,
                 "format": "json",
             },
-            timeout=15,
         )
-        response.raise_for_status()
-        data = response.json()
         pages = data.get("query", {}).get("pages", {})
         for page_id, page_data in pages.items():
             if page_id == "-1":
@@ -51,31 +56,60 @@ def _try_extracts(client: httpx.Client, base_url: str, title: str) -> str | None
             if extract:
                 return extract.strip()
         return None
+    except ResponseTooLarge:
+        raise
     except Exception:
         return None
 
 
 def _try_parse(client: httpx.Client, base_url: str, title: str) -> str | None:
-    """Retrieve and simplify article wikitext as a fallback, returning None when retrieval fails."""
+    """Retrieve and simplify article wikitext as a fallback, returning None when retrieval fails.
+
+    Redirect pages are followed to their target. Oversized responses propagate.
+    """
     try:
-        response = client.get(
+        data = get_json(
+            client,
             f"{base_url}/api.php",
-            params={
+            {
                 "action": "parse",
                 "page": title,
                 "prop": "wikitext",
+                "redirects": 1,
                 "format": "json",
             },
-            timeout=15,
         )
-        response.raise_for_status()
-        data = response.json()
         wikitext = data.get("parse", {}).get("wikitext", {}).get("*", "")
         if not wikitext:
             return None
         return _clean_wikitext(wikitext)
+    except ResponseTooLarge:
+        raise
     except Exception:
         return None
+
+
+def _remove_non_text_links(text: str) -> str:
+    """Drop [[Category:...]], [[File:...]] and [[Image:...]] links, including nested caption links."""
+    parts = []
+    position = 0
+    while match := _NON_TEXT_LINK.search(text, position):
+        parts.append(text[position:match.start()])
+        depth, index = 0, match.start()
+        while index < len(text):
+            if text.startswith("[[", index):
+                depth += 1
+                index += 2
+            elif text.startswith("]]", index):
+                depth -= 1
+                index += 2
+                if depth == 0:
+                    break
+            else:
+                index += 1
+        position = index
+    parts.append(text[position:])
+    return "".join(parts)
 
 
 def _clean_wikitext(text: str) -> str:
@@ -83,6 +117,8 @@ def _clean_wikitext(text: str) -> str:
     # Remove templates like {{...}} (two passes for simple nesting).
     text = re.sub(r"\{\{[^{}]*\}\}", "", text)
     text = re.sub(r"\{\{[^{}]*\}\}", "", text)
+    # Remove category / file / image links before generic link rewriting.
+    text = _remove_non_text_links(text)
     # Convert wiki links [[Target|Display]] -> Display, [[Target]] -> Target.
     text = re.sub(r"\[\[[^|\]]*\|([^\]]+)\]\]", r"\1", text)
     text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
@@ -95,10 +131,6 @@ def _clean_wikitext(text: str) -> str:
     text = re.sub(r"={2,}\s*(.+?)\s*={2,}", r"\n\1\n", text)
     # Remove bold/italic markup.
     text = re.sub(r"'{2,5}", "", text)
-    # Remove category / file / image links.
-    text = re.sub(r"\[\[Category:[^\]]+\]\]", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\[\[File:[^\]]+\]\]", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\[\[Image:[^\]]+\]\]", "", text, flags=re.IGNORECASE)
     # Collapse excessive whitespace.
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"  +", " ", text)
@@ -142,10 +174,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    with httpx.Client() as client:
-        content = _try_extracts(client, base_url, args.title)
-        if content is None:
-            content = _try_parse(client, base_url, args.title)
+    try:
+        with httpx.Client() as client:
+            content = _try_extracts(client, base_url, args.title)
+            if content is None:
+                content = _try_parse(client, base_url, args.title)
+    except ResponseTooLarge as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     if content is None:
         print(

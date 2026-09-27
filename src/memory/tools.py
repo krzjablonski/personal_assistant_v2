@@ -53,10 +53,19 @@ class SaveMemoryTool(ITool):
             ],
             policy=ToolPolicy(
                 mutates_local=True,
+                requires_approval=True,
+                approval_reason=(
+                    "Saved memories are recalled in future conversations; "
+                    "confirm this content reflects what you want remembered."
+                ),
                 can_parallel=False,
                 max_output_chars=20_000,
             ),
         )
+
+    def approval_arguments(self, args: dict) -> dict:
+        """Show exactly the content and effective category that will be stored."""
+        return {"content": args.get("content"), "category": args.get("category", "general")}
 
     async def run(self, args: dict) -> ToolResult:
         """Validate and save information for future conversations, returning a confirmation or error text."""

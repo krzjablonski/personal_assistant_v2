@@ -230,7 +230,7 @@ class TestPreparedActions(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.metadata["not_executed"])
         self.assertNotIn("uncertain_changes", result.metadata)
 
-    async def test_display_includes_full_sanitized_scope(self):
+    async def test_display_includes_full_exact_scope(self):
         store = ToolApprovalStore()
         recipient = "review-" + "x" * 200 + "@example.com"
         request = store.request("write", {"command": ["write", "--token", "argv-secret"], "cwd": "/safe/work", "recipient": recipient, "token": "fixture-secret"}, "review")
@@ -241,8 +241,9 @@ class TestPreparedActions(unittest.IsolatedAsyncioTestCase):
         text = output.getvalue()
         self.assertIn(recipient, text)
         self.assertIn("/safe/work", text)
-        self.assertNotIn("fixture-secret", text)
-        self.assertNotIn("argv-secret", text)
+        # Model-authored values are shown exactly, even when credential-shaped.
+        self.assertIn("fixture-secret", text)
+        self.assertIn("argv-secret", text)
 
     def test_confirmed_google_identity_only_labels_the_matching_credential(self):
         token = '{"refresh_token":"fixture-private"}'

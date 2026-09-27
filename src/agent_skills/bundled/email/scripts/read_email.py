@@ -12,7 +12,9 @@ from google_credentials import GoogleCredentialsError, load_google_credentials
 DEFAULT_MAX_BODY_CHARS = 2000
 MIN_BODY_CHARS = 200
 MAX_BODY_CHARS = 20000
-MAX_EMAILS = 1000
+MAX_EMAILS = 100
+# Keep the JSON document safely below the runtime's 1 MB stdout capture.
+MAX_OUTPUT_CHARS = 900_000
 SYSTEM_LABELS = {
     "INBOX": "INBOX",
     "SENT": "SENT",
@@ -74,6 +76,23 @@ def _message_ids(service, count: int, label_id: str | None, query: str | None):
     return message_ids
 
 
+def _fit_output(email: dict, remaining: int) -> dict | None:
+    """Shorten an email body so its JSON fits ``remaining`` characters, or return None if it cannot."""
+    if len(json.dumps(email)) + 2 <= remaining:
+        return email
+    body = email.get("body") or ""
+    low, high = 0, len(body)  # longest body prefix that fits, found by bisection
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = {**email, "body": body[:middle], "body_truncated": True}
+        if len(json.dumps(candidate)) + 2 <= remaining:
+            low = middle
+        else:
+            high = middle - 1
+    fitted = {**email, "body": body[:low], "body_truncated": True}
+    return fitted if len(json.dumps(fitted)) + 2 <= remaining else None
+
+
 def main(argv: list[str] | None = None) -> int:
     """Read selected Gmail messages and print JSON summaries with bounded bodies.
 
@@ -81,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     for credential, dependency, or message-read failures.
     """
     parser = argparse.ArgumentParser(description="Read messages through the Gmail API.")
-    parser.add_argument("--count", type=int, default=5, help="Number of emails (1-1000).")
+    parser.add_argument("--count", type=int, default=5, help=f"Number of emails (1-{MAX_EMAILS}).")
     parser.add_argument("--folder", default="INBOX", help="Gmail label (default INBOX).")
     parser.add_argument("--query", default=None, help="Native Gmail search query.")
     parser.add_argument(
@@ -112,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
         service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
         query = (args.query or "").strip() or None
         emails = []
+        output_truncated = False
+        remaining = MAX_OUTPUT_CHARS - 1000  # reserve room for the envelope fields
         for message_id in _message_ids(service, count, _label_id(args.folder), query):
             response = (
                 service.users()
@@ -122,11 +143,16 @@ def main(argv: list[str] | None = None) -> int:
             raw = response.get("raw")
             if not isinstance(raw, str):
                 raise ValueError(f"Gmail returned no message content for {message_id}")
-            emails.append(
-                parse_email(
-                    decode_gmail_raw(raw), message_id, max_body_chars
-                )
+            email = _fit_output(
+                parse_email(decode_gmail_raw(raw), message_id, max_body_chars),
+                remaining,
             )
+            if email is not None:
+                emails.append(email)
+                remaining -= len(json.dumps(email)) + 2
+            if email is None or email.get("body_truncated"):
+                output_truncated = True
+                break
     except RefreshError:
         print(
             "Error: Google authorization expired. Reconnect with --connect-google.",
@@ -147,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             "count": len(emails),
             "requested_count": count,
             "selection_limit_reached": len(emails) == count,
+            "output_truncated": output_truncated,
             "emails": emails,
         },
         sys.stdout,

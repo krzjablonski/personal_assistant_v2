@@ -19,7 +19,7 @@ class ConsoleToolTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.workspace, self.outputs = self.root / "work", self.root / "outputs"
-        self.workspace.mkdir(); self.outputs.mkdir()
+        self.workspace.mkdir(); self.outputs.mkdir(mode=0o700)
         self.console = DockerConsole(self.workspace, self.outputs)
         self.environment = ConsoleEnvironment("/usr/bin/docker", "unix:///local.sock", "sha256:" + "a" * 64,
                                               "arm64", tuple(self.console.mounts()), 501, 20)

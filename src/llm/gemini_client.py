@@ -24,6 +24,7 @@ _GEMINI_CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-2.5-pro-preview": 1_048_576,
 }
 _GEMINI_FALLBACK_CONTEXT_WINDOW = 1_048_576
+_GEMINI_HTTP_TIMEOUT_MS = 120_000
 
 
 class GeminiClient(ILLMClient):
@@ -51,7 +52,10 @@ class GeminiClient(ILLMClient):
         """Allocate the SDK connection pool only when a request needs it."""
         if self._closed:
             raise RuntimeError("Model client is closed")
-        return genai.Client(api_key=self.api_key)
+        return genai.Client(
+            api_key=self.api_key,
+            http_options=genai_types.HttpOptions(timeout=_GEMINI_HTTP_TIMEOUT_MS),
+        )
 
     async def aclose(self) -> None:
         if self._closed:

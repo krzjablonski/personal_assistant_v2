@@ -3,7 +3,7 @@ import tempfile
 import unittest
 import io
 from contextlib import redirect_stdout, redirect_stderr
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 import httpx
@@ -205,6 +205,8 @@ class WebRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 runtime = SkillRuntime(SkillCatalog.discover(), output_directory=Path(directory),
                                        env_provider=build_skill_env_provider(SimpleNamespace(get=values.get)))
                 runtime.load_skill_instructions('web-research')
+                # Extraction sends a URL to a third party, so it needs explicit approval.
+                runtime.approval_store.approval_handler = AsyncMock(return_value=True)
                 with patch('agent_skills.runtime.run_script', side_effect=boundary):
                     found = await runtime.run_command('web-research', ['scripts/search.py', '--query', 'question'])
                     read = await runtime.run_command('web-research', ['scripts/extract.py', '--url', 'https://example.com'])
